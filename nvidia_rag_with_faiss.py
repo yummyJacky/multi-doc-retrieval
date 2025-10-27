@@ -15,85 +15,6 @@ import pickle
 from tqdm.auto import tqdm
 from openai import OpenAI
 
-
-# ============================================================================
-# 多文档检索工具函数
-# ============================================================================
-
-def get_top_k_pages(
-    docid2scores: Dict[str, List[float]], 
-    k: int
-) -> List[Tuple[str, int, float]]:
-    """
-    从所有文档的所有页面中选择 top-k（跨文档跨页面检索）
-    
-    Args:
-        docid2scores: {doc_id: [scores]} 每个文档的页面分数列表
-        k: 返回top-k个页面
-        
-    Returns:
-        [(doc_id, page_idx, score), ...] 按分数降序排列
-        
-    Example:
-        docid2scores = {
-            "doc1": [10, 50, 30],
-            "doc2": [40, 20, 60],
-            "doc3": [70, 90]
-        }
-        get_top_k_pages(docid2scores, k=3)
-        # 返回: [('doc3', 1, 90), ('doc3', 0, 70), ('doc2', 2, 60)]
-    """
-    # 1. 展平所有页面
-    flattened = [
-        (doc_id, page_idx, score)
-        for doc_id, scores in docid2scores.items()
-        for page_idx, score in enumerate(scores)
-    ]
-    
-    # 2. 按分数排序
-    flattened.sort(key=lambda x: x[2], reverse=True)
-    
-    # 3. 返回 top-k
-    return flattened[:k]
-
-
-def get_top_k_pages_single_page_from_each_doc(
-    docid2scores: Dict[str, List[float]], 
-    k: int
-) -> List[Tuple[str, int, float]]:
-    """
-    每个文档只返回得分最高的一页（保证文档多样性）
-    
-    Args:
-        docid2scores: {doc_id: [scores]} 每个文档的页面分数列表
-        k: 返回top-k个文档
-        
-    Returns:
-        [(doc_id, page_idx, score), ...] 按分数降序排列
-        
-    Example:
-        docid2scores = {
-            "doc1": [10, 50, 30],
-            "doc2": [40, 20, 60],
-            "doc3": [70, 90]
-        }
-        get_top_k_pages_single_page_from_each_doc(docid2scores, k=2)
-        # 返回: [('doc3', 1, 90), ('doc2', 2, 60)]
-    """
-    # 1. 每个文档选最高分页
-    highest_per_doc = []
-    for doc_id, scores in docid2scores.items():
-        if len(scores) > 0:
-            max_idx = max(range(len(scores)), key=lambda i: scores[i])
-            highest_per_doc.append((doc_id, max_idx, scores[max_idx]))
-    
-    # 2. 按分数排序
-    highest_per_doc.sort(key=lambda x: x[2], reverse=True)
-    
-    # 3. 返回 top-k 文档
-    return highest_per_doc[:k]
-
-
 class GPUMemoryMonitor:
     """GPU显存监控工具"""
     
@@ -639,6 +560,11 @@ class NvidiaRAGPipeline:
             with open(mapping_path, 'wb') as f:
                 pickle.dump(self.token2pageuid, f)
             print(f"  - 映射已保存: {mapping_path}")
+
+            # all_token_embeddings可能很大，所以只在save_dir存在时保存
+            embeddings_path = save_path / "all_token_embeddings.npy"
+            np.save(embeddings_path, self.all_token_embeddings)
+            print(f"  - Token嵌入已保存: {embeddings_path}")
         
         print(f"{'='*80}\n")
     
@@ -863,34 +789,30 @@ class NvidiaRAGPipeline:
                 reverse=True
             )
             
-            # 解析页面UID并按文档分组
-            docid2scores = {}
-            page_uid_to_info = {}
-            
+            # 解析页面UID
+            parsed_results = []
             for page_uid, score in sorted_pages:
                 # page_uid格式: "doc_id_page{page_idx}"
                 parts = page_uid.rsplit('_page', 1)
                 if len(parts) == 2:
                     doc_id = parts[0]
                     page_idx = int(parts[1])
-                else:
-                    continue
-                
-                if doc_id not in docid2scores:
-                    docid2scores[doc_id] = []
-                
-                docid2scores[doc_id].append(score)
-                page_uid_to_info[page_uid] = {
-                    'doc_id': doc_id,
-                    'page_idx': page_idx,
-                    'score': float(score)
-                }
+                    parsed_results.append((doc_id, page_idx, float(score)))
             
             # 应用检索策略
             if single_page_per_doc:
-                top_pages = get_top_k_pages_single_page_from_each_doc(docid2scores, k=top_k)
+                # 每个文档只保留最高分的一页
+                seen_docs = set()
+                top_pages = []
+                for doc_id, page_idx, score in parsed_results:
+                    if doc_id not in seen_docs:
+                        seen_docs.add(doc_id)
+                        top_pages.append((doc_id, page_idx, score))
+                        if len(top_pages) >= top_k:
+                            break
             else:
-                top_pages = get_top_k_pages(docid2scores, k=top_k)
+                # 跨文档跨页面，直接取top-k
+                top_pages = parsed_results[:top_k]
             
             # 格式化结果
             formatted_results = []

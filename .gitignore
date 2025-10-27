@@ -145,7 +145,6 @@ multimodalqa_screenshots
 *.jsonl*
 
 setup_BCOS_README.md
-*.ipynb
 
 .env
 READDME copy.md
