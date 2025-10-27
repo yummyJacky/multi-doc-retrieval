@@ -1023,7 +1023,7 @@ class VQAModel:
             # 多图片时，添加提示语
             content.append({
                 "type": "text",
-                "text": f"请综合分析以下 {len(images)} 张图片，回答问题：{query}"
+                "text": f"请综合分析以下 {len(images)} 张图片，回答问题：{query}。若图片中没有符合关于query的内容，请回答不存在相关内容，不要编造。"
             })
         else:
             content.append({
