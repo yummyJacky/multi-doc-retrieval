@@ -421,9 +421,13 @@ class NvidiaRAGPipeline:
         self.page_ids = None
         
         # 多文档模式
-        self.docid2embeddings: Dict[str, torch.Tensor] = {}  # {doc_id: embeddings}
+        self.docid2embeddings: Dict[str, torch.Tensor] = {}  # {doc_id: embeddings [n_pages, n_tokens, dim]}
         self.docid2page_ids: Dict[str, List[str]] = {}  # {doc_id: [page_ids]}
         self.is_multi_doc_mode = False
+        
+        # Token级索引（M3DocRAG风格）
+        self.all_token_embeddings = None  # 扁平化的所有token嵌入 [total_tokens, dim]
+        self.token2pageuid = None  # token到页面的映射 List[str]
     
     def encode_passages(
         self,
@@ -530,7 +534,14 @@ class NvidiaRAGPipeline:
             self.faiss_manager.save(save_dir)
     
     def build_unified_index(self, save_dir: Optional[str] = None):
-        """构建统一的多文档索引"""
+        """
+        构建统一的多文档Token级索引（M3DocRAG风格）
+        
+        关键改进：
+        1. 扁平化所有token而不是页面
+        2. 维护token到页面的映射关系
+        3. 保留Late Interaction的细粒度匹配能力
+        """
         if not self.use_faiss:
             print("⚠️ FAISS索引未启用")
             return
@@ -539,45 +550,132 @@ class NvidiaRAGPipeline:
             raise ValueError("请先调用 encode_documents() 编码多个文档")
         
         print(f"\n{'='*80}")
-        print(f"构建统一多文档索引")
+        print(f"构建Token级多文档索引（M3DocRAG风格）")
         print(f"{'='*80}")
         
-        # 合并所有文档的嵌入
-        all_embeddings = []
-        all_page_ids = []
+        # Token级扁平化
+        all_token_embeddings = []
+        token2pageuid = []
+        
+        total_pages = 0
+        total_tokens = 0
         
         for doc_id in sorted(self.docid2embeddings.keys()):
-            embeddings = self.docid2embeddings[doc_id]
-            page_ids = self.docid2page_ids[doc_id]
+            doc_embs = self.docid2embeddings[doc_id]  # [n_pages, n_tokens, dim]
+            n_pages = doc_embs.shape[0]
             
-            all_embeddings.append(embeddings)
-            all_page_ids.extend(page_ids)
+            print(f"  - {doc_id}: {n_pages} 页")
             
-            print(f"  - {doc_id}: {len(page_ids)} 页")
+            # 遍历每一页
+            for page_idx in range(n_pages):
+                page_emb = doc_embs[page_idx]  # [n_tokens, dim]
+                n_tokens = page_emb.shape[0]
+                
+                # 添加页面的所有token
+                all_token_embeddings.append(page_emb)
+                
+                # 创建页面UID并记录映射
+                page_uid = f"{doc_id}_page{page_idx}"
+                token2pageuid.extend([page_uid] * n_tokens)
+                
+                total_tokens += n_tokens
+            
+            total_pages += n_pages
         
-        # 合并所有嵌入
-        unified_embeddings = torch.cat(all_embeddings, dim=0)
-        print(f"\n✓ 合并完成：总共 {len(all_page_ids)} 页")
+        print(f"\n✓ Token扁平化完成：")
+        print(f"  - 总页面数: {total_pages}")
+        print(f"  - 总Token数: {total_tokens}")
         
-        # 转换为numpy数组
-        embeddings_np = unified_embeddings.numpy()
+        # 合并所有token嵌入
+        all_token_embeddings = torch.cat(all_token_embeddings, dim=0)  # [total_tokens, dim]
+        print(f"  - 嵌入形状: {all_token_embeddings.shape}")
         
-        # 构建索引
-        self.faiss_manager.build_index(embeddings_np, all_page_ids)
+        # 保存到实例变量
+        self.all_token_embeddings = all_token_embeddings.cpu().numpy().astype(np.float32)
+        self.token2pageuid = token2pageuid
         
-        # 保存索引
+        # 构建FAISS索引
+        print(f"\n构建FAISS索引...")
+        self.faiss_manager.index = None  # 清空旧索引
+        
+        # 重新初始化索引
+        embedding_dim = self.all_token_embeddings.shape[1]
+        quantizer = faiss.IndexFlatIP(embedding_dim)
+        
+        if self.faiss_manager.index_type == "flatip":
+            index = quantizer
+        elif self.faiss_manager.index_type == "ivfflat":
+            index = faiss.IndexIVFFlat(
+                quantizer, 
+                embedding_dim, 
+                self.faiss_manager.nlist
+            )
+        else:
+            raise ValueError(f"不支持的索引类型: {self.faiss_manager.index_type}")
+        
+        # 训练和添加数据
+        if self.faiss_manager.index_type != "flatip":
+            print(f"  训练索引...")
+            index.train(self.all_token_embeddings)
+        
+        print(f"  添加向量...")
+        index.add(self.all_token_embeddings)
+        
+        self.faiss_manager.index = index
+        print(f"✓ 索引构建完成")
+        
+        # 保存索引和映射
         if save_dir:
-            self.faiss_manager.save(save_dir)
+            save_path = Path(save_dir)
+            save_path.mkdir(parents=True, exist_ok=True)
+            
+            # 保存FAISS索引
+            index_path = save_path / "index.bin"
+            faiss.write_index(index, str(index_path))
+            print(f"  - 索引已保存: {index_path}")
+            
+            # 保存token2pageuid映射
+            mapping_path = save_path / "token2pageuid.pkl"
+            with open(mapping_path, 'wb') as f:
+                pickle.dump(self.token2pageuid, f)
+            print(f"  - 映射已保存: {mapping_path}")
         
         print(f"{'='*80}\n")
     
     def load_index(self, load_dir: str):
-        """加载已保存的索引"""
+        """加载已保存的索引和token映射"""
         if not self.use_faiss:
             print("⚠️ FAISS索引未启用")
             return
         
-        self.faiss_manager.load(load_dir)
+        load_path = Path(load_dir)
+        
+        # 加载FAISS索引
+        index_path = load_path / "index.bin"
+        if index_path.exists():
+            self.faiss_manager.index = faiss.read_index(str(index_path))
+            print(f"✓ 索引已加载: {index_path}")
+        else:
+            raise FileNotFoundError(f"索引文件不存在: {index_path}")
+        
+        # 加载token2pageuid映射
+        mapping_path = load_path / "token2pageuid.pkl"
+        if mapping_path.exists():
+            with open(mapping_path, 'rb') as f:
+                self.token2pageuid = pickle.load(f)
+            print(f"✓ Token映射已加载: {mapping_path} ({len(self.token2pageuid)} tokens)")
+        else:
+            print(f"⚠️ 未找到token映射文件: {mapping_path}")
+            self.token2pageuid = None
+        
+        # 尝试加载all_token_embeddings（用于精确分数计算）
+        # 注意：这个文件可能很大，如果不存在也可以工作（但精度可能略低）
+        embeddings_path = load_path / "all_token_embeddings.npy"
+        if embeddings_path.exists():
+            self.all_token_embeddings = np.load(embeddings_path)
+            print(f"✓ Token嵌入已加载: {embeddings_path}")
+        else:
+            print(f"⚠️ 未找到token嵌入文件（将使用FAISS近似分数）")
     
     def retrieve(
         self,
@@ -664,59 +762,129 @@ class NvidiaRAGPipeline:
         queries: List[str],
         top_k: int = 10,
         single_page_per_doc: bool = False,
-        use_index: bool = True,
         batch_size: int = 8
     ) -> List[List[Dict]]:
         """
-        多文档检索（支持两种模式）
+        多文档检索（M3DocRAG风格 - Token级MaxSim聚合）
         
         Args:
             queries: 查询文本列表
             top_k: 返回top-k个页面
             single_page_per_doc: 是否每个文档只返回一页（保证文档多样性）
-            use_index: 是否使用FAISS索引
             batch_size: 批处理大小
             
         Returns:
             List[List[Dict]]: 每个查询对应一个结果列表
+            
+        实现要点：
+        1. 对每个查询token找到最近的文档token
+        2. 使用MaxSim聚合：每个查询token对每个页面只保留最高分
+        3. 对所有查询token的MaxSim分数求和
+        4. 应用检索策略（跨页面或单页）
         """
         if not self.is_multi_doc_mode:
             raise ValueError("请先调用 encode_documents() 进入多文档模式")
         
-        # 使用统一索引检索
-        all_results = self.retrieve(
-            queries=queries,
-            top_k=top_k * len(self.docid2embeddings) if single_page_per_doc else top_k * 10,
-            use_index=use_index,
-            batch_size=batch_size
+        if self.faiss_manager.index is None:
+            raise ValueError("请先调用 build_unified_index() 构建索引")
+        
+        if self.token2pageuid is None:
+            raise ValueError("Token映射未加载，请确保索引已正确构建")
+        
+        # 确保queries是列表
+        if isinstance(queries, str):
+            queries = [queries]
+        
+        print(f"\n{'='*80}")
+        print(f"多文档检索 - Token级MaxSim聚合")
+        print(f"{'='*80}")
+        print(f"查询数量: {len(queries)}")
+        print(f"检索模式: {'每文档单页' if single_page_per_doc else '跨文档跨页面'}")
+        
+        # 编码查询
+        query_embeddings = self.retriever_model.forward_queries(
+            queries, batch_size=batch_size
         )
+        query_embeddings_cpu = query_embeddings.cpu().numpy().astype(np.float32)
         
-        # 后处理：应用多文档检索策略
-        processed_results = []
+        all_results = []
         
-        for query_results in all_results:
-            # 按文档分组
-            docid2scores = {}
-            page_info_map = {}  # 存储完整的页面信息
+        # 对每个查询进行检索
+        for q_idx, query in enumerate(tqdm(queries, desc="检索查询")):
+            query_emb = query_embeddings_cpu[q_idx]  # [n_query_tokens, dim]
+            n_query_tokens = query_emb.shape[0]
             
-            for result in query_results:
-                page_id = result['page_id']
-                # 解析 doc_id 和 page_idx
-                # page_id 格式: "doc_id_page_idx"
-                parts = page_id.rsplit('_page_', 1)
+            # FAISS最近邻搜索
+            # 对每个查询token找k个最近的文档token
+            k_nn = top_k * 10  # 多找一些候选
+            D, I = self.faiss_manager.index.search(query_emb, k_nn)
+            
+            # MaxSim聚合
+            final_page2scores = {}
+            
+            # 遍历每个查询token
+            for token_idx in range(n_query_tokens):
+                current_query_token_page2scores = {}
+                
+                # 遍历该查询token的k个最近邻
+                for nn_idx in range(k_nn):
+                    found_token_idx = I[token_idx, nn_idx]
+                    
+                    # 获取该token所属的页面
+                    page_uid = self.token2pageuid[found_token_idx]
+                    
+                    # 计算精确分数
+                    if self.all_token_embeddings is not None:
+                        doc_token_emb = self.all_token_embeddings[found_token_idx]
+                        score = (query_emb[token_idx] * doc_token_emb).sum()
+                    else:
+                        # 如果没有加载token嵌入，使用FAISS返回的距离
+                        score = D[token_idx, nn_idx]
+                    
+                    # MaxSim: 每个查询token对每个页面只保留最高分
+                    if page_uid not in current_query_token_page2scores:
+                        current_query_token_page2scores[page_uid] = score
+                    else:
+                        current_query_token_page2scores[page_uid] = max(
+                            current_query_token_page2scores[page_uid], score
+                        )
+                
+                # 累加所有查询token的MaxSim分数
+                for page_uid, score in current_query_token_page2scores.items():
+                    if page_uid in final_page2scores:
+                        final_page2scores[page_uid] += score
+                    else:
+                        final_page2scores[page_uid] = score
+            
+            # 排序页面
+            sorted_pages = sorted(
+                final_page2scores.items(), 
+                key=lambda x: x[1], 
+                reverse=True
+            )
+            
+            # 解析页面UID并按文档分组
+            docid2scores = {}
+            page_uid_to_info = {}
+            
+            for page_uid, score in sorted_pages:
+                # page_uid格式: "doc_id_page{page_idx}"
+                parts = page_uid.rsplit('_page', 1)
                 if len(parts) == 2:
                     doc_id = parts[0]
                     page_idx = int(parts[1])
                 else:
-                    # 单文档模式的兼容
-                    doc_id = "default"
-                    page_idx = result['page_index']
+                    continue
                 
                 if doc_id not in docid2scores:
                     docid2scores[doc_id] = []
                 
-                docid2scores[doc_id].append(result['score'])
-                page_info_map[f"{doc_id}_{page_idx}"] = result
+                docid2scores[doc_id].append(score)
+                page_uid_to_info[page_uid] = {
+                    'doc_id': doc_id,
+                    'page_idx': page_idx,
+                    'score': float(score)
+                }
             
             # 应用检索策略
             if single_page_per_doc:
@@ -727,16 +895,23 @@ class NvidiaRAGPipeline:
             # 格式化结果
             formatted_results = []
             for rank, (doc_id, page_idx, score) in enumerate(top_pages, 1):
-                key = f"{doc_id}_{page_idx}"
-                if key in page_info_map:
-                    result = page_info_map[key].copy()
-                    result['rank'] = rank
-                    result['doc_id'] = doc_id
-                    formatted_results.append(result)
+                page_uid = f"{doc_id}_page{page_idx}"
+                formatted_results.append({
+                    'query': query,
+                    'doc_id': doc_id,
+                    'page_idx': page_idx,
+                    'page_num': page_idx + 1,
+                    'page_id': page_uid,
+                    'score': float(score),
+                    'rank': rank
+                })
             
-            processed_results.append(formatted_results)
+            all_results.append(formatted_results)
         
-        return processed_results
+        print(f"✓ 检索完成")
+        print(f"{'='*80}\n")
+        
+        return all_results
 
 
 class ImageReranker:
