@@ -420,4 +420,3 @@ python test_corrected_logic.py
 
 **修改文件**: `nvidia_rag_with_faiss.py`
 
-**测试文件**: `test_corrected_logic.py`

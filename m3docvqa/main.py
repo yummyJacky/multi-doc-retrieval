@@ -98,8 +98,17 @@ def download_pdfs(
     proc_id: int = 0, 
     n_proc: int = 1,
     check_downloaded: bool = False,
+    proxy_server: str = None,
+    proxy_username: str = None,
+    proxy_password: str = None,
     ):
-    """Download Wikipedia pages as PDFs."""
+    """Download Wikipedia pages as PDFs.
+    
+    Args:
+        proxy_server: Proxy server URL (e.g., 'http://127.0.0.1:7890' or 'socks5://127.0.0.1:1080')
+        proxy_username: Proxy username (optional)
+        proxy_password: Proxy password (optional)
+    """
     # Load document ids for the specified split
     if per_split_doc_ids:
         with open(per_split_doc_ids, "r") as f:
@@ -114,8 +123,18 @@ def download_pdfs(
         urls = urls[proc_id::n_proc]
         save_paths = save_paths[proc_id::n_proc]
 
+    # 配置代理
+    proxy = None
+    if proxy_server:
+        proxy = {'server': proxy_server}
+        if proxy_username:
+            proxy['username'] = proxy_username
+        if proxy_password:
+            proxy['password'] = proxy_password
+        logger.info(f"Using proxy: {proxy_server}")
+    
     logger.info(f"[{proc_id}/{n_proc}] Starting download of {len(urls)} PDFs to {pdf_dir}")
-    download_results = download_wiki_page(urls, save_paths, "pdf", result_log_dir, proc_id, n_proc)
+    download_results = download_wiki_page(urls, save_paths, "pdf", result_log_dir, proc_id, n_proc, proxy=proxy)
     logger.info(f"[{proc_id}/{n_proc}] Download completed with {sum(download_results)} successful downloads out of {len(urls)}")
 
 

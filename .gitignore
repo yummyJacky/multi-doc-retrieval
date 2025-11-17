@@ -14,7 +14,9 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
+lib/**
+!lib/
+!lib/external-lib/   
 lib64/
 parts/
 sdist/
@@ -134,6 +136,7 @@ dmypy.json
 # DATA
 data/
 faiss_index/
+job/
 # for MacOS
 *.DS_Store
 
