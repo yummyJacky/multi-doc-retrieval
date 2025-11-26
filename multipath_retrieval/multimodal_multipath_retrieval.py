@@ -8,7 +8,7 @@
 3. 多路召回结果融合
 4. 统一的检索接口
 """
-
+import os
 import logging
 import time
 from dataclasses import dataclass
@@ -20,7 +20,8 @@ import torch
 from PIL import Image
 from pdf2image import convert_from_path
 from transformers import AutoModel, AutoProcessor
-
+from dotenv import load_dotenv
+load_dotenv()
 # 设置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -414,7 +415,7 @@ def main():
     # 配置
     DEVICE = "cuda:3"
     PDF_PATH = "contents/2024_Tencent_ESG.pdf"
-    HF_TOKEN = "***REMOVED***"
+    HF_TOKEN = os.getenv("HF_TOKEN")
     
     # 测试查询
     queries = [

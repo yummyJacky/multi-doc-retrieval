@@ -3,12 +3,13 @@
 多路召回系统测试脚本
 用于快速验证系统功能
 """
-
+import os
 import sys
 import time
 import logging
 from pathlib import Path
-
+from dotenv import load_dotenv
+load_dotenv()
 # 添加当前目录到路径
 sys.path.append(str(Path(__file__).parent))
 
@@ -29,7 +30,7 @@ def test_basic_functionality():
     # 配置
     DEVICE = "cuda:6"
     PDF_PATH = "contents/2024_Tencent_ESG.pdf"
-    HF_TOKEN = "***REMOVED***"
+    HF_TOKEN = os.getenv("HF_TOKEN")
     
     # 测试查询
     test_queries = [
