@@ -19,7 +19,6 @@ from tqdm.auto import tqdm
 from openai import OpenAI
 from colpali_engine.models import ColQwen2, ColQwen2Processor
 from colpali_engine.models import ColQwen2_5, ColQwen2_5_Processor
-from transformers import AutoModelForCausalLM, AutoProcessor
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from models.gme import GmeQwen2VL
@@ -550,20 +549,77 @@ class GMELayoutPDFRetriever:
         return results
 
 
-def _simple_split_text(text: str, chunk_size: int = 1000, chunk_overlap: int = 50) -> List[str]:
-    """简单的滑动窗口文本切分，避免依赖额外库"""
-    if not text:
-        return []
-    chunks: List[str] = []
-    start = 0
-    text_len = len(text)
-    while start < text_len:
-        end = min(start + chunk_size, text_len)
-        chunks.append(text[start:end])
-        if end == text_len:
-            break
-        start = max(0, end - chunk_overlap)
-    return chunks
+class DotsOCRPageTextExtractor:
+    """从 dots_ocr 解析中提取每页纯文本的辅助类。
+
+    预期输入目录结构示例：
+        <ocr_output_dir>/xxx_page_0.jpg
+        <ocr_output_dir>/xxx_page_0.md  # JSON list: [{"bbox": ..., "category": ..., "text": ...}, ...]
+
+    作用：
+        - 从每个 xxx_page_*.md 中抽取所有 item["text"], 拼接为单页文本
+        - 按页号排序返回 List[str]（page0_text, page1_text, ...）
+        - 可选在同目录下写入 xxx_page_0_text.md 等纯文本文件
+    """
+
+    def __init__(self, text_suffix: str = "_text") -> None:
+        self.text_suffix = text_suffix
+
+    def extract_page_texts(
+        self,
+        ocr_output_dir: str,
+        save_plaintext_md: bool = True,
+    ) -> List[str]:
+        base_dir = Path(ocr_output_dir)
+        if not base_dir.exists():
+            raise FileNotFoundError(f"OCR output directory not found: {ocr_output_dir}")
+
+        page_texts_map: Dict[int, str] = {}
+
+        for md_file in sorted(base_dir.glob("*_page_*.md")):
+            stem = md_file.stem  # e.g. xxx_page_0
+            # 跳过已经是纯文本的文件（例如 *_text.md）
+            if stem.endswith(self.text_suffix):
+                continue
+
+            try:
+                _, page_part = stem.rsplit("_page_", 1)
+                page_idx = int(page_part)
+            except ValueError:
+                # 文件名不符合预期模式时跳过
+                continue
+
+            raw = md_file.read_text(encoding="utf-8")
+            try:
+                data = json.loads(raw)
+            except Exception:
+                # 不是合法 JSON 时跳过该页
+                continue
+
+            if not isinstance(data, list):
+                continue
+
+            parts: List[str] = []
+            for item in data:
+                if isinstance(item, dict):
+                    value = item.get("text")
+                    if isinstance(value, str) and value.strip():
+                        parts.append(value.strip())
+
+            page_text = "\n".join(parts)
+
+            if save_plaintext_md:
+                text_md_path = md_file.with_name(stem + f"{self.text_suffix}.md")
+                text_md_path.write_text(page_text, encoding="utf-8")
+
+            page_texts_map[page_idx] = page_text
+
+        # 按页号排序，构造 page_texts 列表
+        page_texts: List[str] = []
+        for idx in sorted(page_texts_map.keys()):
+            page_texts.append(page_texts_map[idx])
+
+        return page_texts
 
 
 class GMETextPDFRetriever:
@@ -581,110 +637,23 @@ class GMETextPDFRetriever:
         self.page_texts: Optional[List[str]] = None
         self.chunk_embeddings: Optional[torch.Tensor] = None  # [n_chunks, dim]
         self.chunk2page: Optional[List[int]] = None
-        self._dot_ocr_model: Optional[AutoModelForCausalLM] = None
-        self._dot_ocr_processor: Optional[AutoProcessor] = None
-        self.device = getattr(gme_model, "device", "cuda" if torch.cuda.is_available() else "cpu")
+        # OCR 抽取与文本分块+embedding 解耦：
+        # 1) OCR / dots_ocr 生成 xxx_page_*.md（或使用 DotsOCRPageTextExtractor 得到 page_texts）
+        # 2) 再基于 page_texts 进行分块和 GME 文本嵌入索引构建
 
-    def _ensure_dot_ocr(self):
-        if self._dot_ocr_model is None and self.use_ocr:
-            model_path = os.environ.get("DOTS_OCR_PATH", "./weights/DotsOCR")
-            self._dot_ocr_model = AutoModelForCausalLM.from_pretrained(
-                model_path,
-                attn_implementation="flash_attention_2",
-                torch_dtype=torch.bfloat16,
-                device_map=self.device,
-                trust_remote_code=True,
-            )
-            self._dot_ocr_model.eval()
-            self._dot_ocr_processor = AutoProcessor.from_pretrained(
-                model_path,
-                trust_remote_code=True,
-            )
-
-    def _run_dot_ocr_on_image(self, image: Image.Image) -> str:
-        self._ensure_dot_ocr()
-        if self._dot_ocr_model is None or self._dot_ocr_processor is None:
-            return ""
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": "dummy_content"},
-                    {
-                        "type": "text",
-                        "text": "Please recognize and output all text from this document image in human reading order. Output plain text only, without translation.",
-                    },
-                ],
-            }
-        ]
-        text = self._dot_ocr_processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        inputs = self._dot_ocr_processor(
-            text=[text],
-            images=[image],
-            padding=True,
-            return_tensors="pt",
-        )
-        device = next(self._dot_ocr_model.parameters()).device
-        inputs = inputs.to(device)
-        with torch.no_grad():
-            generated_ids = self._dot_ocr_model.generate(
-                **inputs,
-                max_new_tokens=4096,
-            )
-        generated_ids_trimmed = [
-            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-        ]
-        output_text = self._dot_ocr_processor.batch_decode(
-            generated_ids_trimmed,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )
-        if isinstance(output_text, list):
-            raw = output_text[0]
-        else:
-            raw = str(output_text)
-        try:
-            data = json.loads(raw)
-            if isinstance(data, list):
-                parts: List[str] = []
-                for item in data:
-                    if isinstance(item, dict):
-                        value = item.get("text")
-                        if isinstance(value, str) and value.strip():
-                            parts.append(value.strip())
-                if parts:
-                    return "\n".join(parts)
-        except Exception:
-            pass
-        return raw
-
-    def _extract_texts_with_ocr(self, images: List[Image.Image]) -> List[str]:
-        texts: List[str] = []
-        for img in images:
-            page_text = self._run_dot_ocr_on_image(img.convert("RGB"))
-            texts.append(page_text)
-        return texts
-
-    def build_index(
+    def build_index_from_texts(
         self,
-        images: List[Image.Image],
-        page_texts: Optional[List[str]] = None,
+        page_texts: List[str],
         chunk_size: int = 1000,
         chunk_overlap: int = 50,
-    ):
-        """构建基于 GME 文本嵌入的简单索引"""
-        if page_texts is None:
-            if not self.use_ocr:
-                self.page_texts = None
-                self.chunk_embeddings = None
-                self.chunk2page = None
-                return
-            page_texts = self._extract_texts_with_ocr(images)
+    ) -> None:
+        """基于给定的每页文本构建 GME 文本嵌入索引。
 
+        仅负责：
+        - 记录 self.page_texts
+        - 文本分块（RecursiveCharacterTextSplitter）
+        - 计算 GME 文本嵌入并构建 chunk-level 索引
+        """
         self.page_texts = page_texts
 
         splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
@@ -705,6 +674,29 @@ class GMETextPDFRetriever:
 
         self.chunk_embeddings = embeddings  # [n_chunks, dim]
         self.chunk2page = chunk2page
+
+    def build_index(
+        self,
+        images: List[Image.Image],
+        page_texts: Optional[List[str]] = None,
+        chunk_size: int = 1000,
+        chunk_overlap: int = 50,
+    ):
+        """构建基于 GME 文本嵌入的简单索引（不在内部执行 OCR）。
+
+        推荐流程：
+        1. 先通过 dots_ocr.parser 解析 PDF，得到 xxx_page_*.md
+        2. 调用 extract_texts_from_ocr_dir(...) 得到 page_texts，并生成纯文本 md
+        3. 再调用本方法或 build_index_from_texts(page_texts, ...)
+        """
+        if page_texts is None:
+            # 未提供文本时，不构建索引
+            self.page_texts = None
+            self.chunk_embeddings = None
+            self.chunk2page = None
+            return
+
+        self.build_index_from_texts(page_texts, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
 
     def get_page_text(self, page_idx: int) -> Optional[str]:
         if self.page_texts is None:

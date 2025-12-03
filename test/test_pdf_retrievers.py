@@ -106,24 +106,69 @@ def test_gme_text_pdf_retriever(gme_model: Optional[GmeQwen2VL], images: List[Im
         print("[SKIP] No images loaded, skip GMETextPDFRetriever test.")
         return
 
-    print("[INFO] Testing GMETextPDFRetriever (without OCR, using provided texts)")
+    # 1) 使用手动提供的文本进行文本到文本检索（不依赖 OCR）
+    print("[INFO] Testing GMETextPDFRetriever (manual texts, use_ocr=False)")
     retriever = GMETextPDFRetriever(gme_model, use_ocr=False)
 
-    # 为每一页构造简单的示例文本，长度与图片页数对齐
+    # 为前几页构造内容差异明显的示例文本，便于检查检索结果是否合理
+    num_pages = len(images)
     example_texts: List[str] = []
-    for idx in range(len(images)):
-        example_texts.append(f"This is example text for page {idx + 1} about greenhouse gas emissions and ESG report.")
+    for idx in range(num_pages):
+        page_num = idx + 1
+        if idx == 0:
+            example_texts.append(
+                f"第{page_num}页主要介绍公司的温室气体排放情况以及减排目标。"
+            )
+        elif idx == 1:
+            example_texts.append(
+                f"第{page_num}页重点描述公司的ESG管治架构和董事会职责。"
+            )
+        else:
+            example_texts.append(
+                f"第{page_num}页为一般性的ESG报告内容示例文本。"
+            )
 
     retriever.build_index(images, page_texts=example_texts)
 
-    query = "温室气体排放"  # 一个与示例文本相关的查询
+    query = "温室气体排放"  # 与第 1 页示例文本强相关的查询
     results = retriever.search(query, top_k=5)
 
-    print(f"[RESULT] GMETextPDFRetriever returned {len(results)} results")
+    print(f"[RESULT] GMETextPDFRetriever (manual texts) returned {len(results)} results")
     for r in results:
         print(
             f"  page_idx={r['page_idx']}, page_num={r['page_num']}, score={r['score']:.4f}"
         )
+
+def test_gme_text_pdf_retriever_with_ocr(gme_model: Optional[GmeQwen2VL], images: List[Image.Image]) -> None:
+    if gme_model is None:
+        print("[SKIP] No GME model, skip GMETextPDFRetriever (OCR) test.")
+        return
+
+    if not images:
+        print("[SKIP] No images loaded, skip GMETextPDFRetriever (OCR) test.")
+        return
+
+    # 直接使用 OCR（DotOCR）抽取文本，再做文本到文本检索
+    # 若环境或权重未配置好，仅打印 warning 不中断整体测试脚本
+    try:
+        print("[INFO] Testing GMETextPDFRetriever with OCR (DotOCR, use_ocr=True)")
+        ocr_retriever = GMETextPDFRetriever(gme_model, use_ocr=True)
+
+        start_page = 0
+        ocr_images = images[start_page:]
+        ocr_retriever.build_index(ocr_images)
+
+        query = "温室气体指标在2030年的目标是什么?"
+        ocr_results = ocr_retriever.search(query, top_k=5)
+        print(
+            f"[RESULT] GMETextPDFRetriever (DotOCR) returned {len(ocr_results)} results"
+        )
+        for r in ocr_results:
+            print(
+                f"  [OCR] page_idx={r['page_idx']+start_page}, page_num={r['page_num']+start_page}, score={r['score']:.4f}"
+            )
+    except Exception as e:
+        print(f"[WARN] OCR-based GMETextPDFRetriever test failed: {e}")
 
 
 def main() -> None:
@@ -133,8 +178,9 @@ def main() -> None:
     # test_colqwen_pdf_retriever(images)
 
     gme_model = load_gme_model()
-    test_gme_layout_pdf_retriever(gme_model, images)
+    # test_gme_layout_pdf_retriever(gme_model, images)
     # test_gme_text_pdf_retriever(gme_model, images)
+    test_gme_text_pdf_retriever_with_ocr(gme_model, images)
 
 
 if __name__ == "__main__":
