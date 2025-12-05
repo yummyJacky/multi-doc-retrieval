@@ -21,6 +21,7 @@ import PyPDF2
 import pytesseract
 import traceback
 from openai import OpenAI
+from dots_ocr.parser import DotsOCRParser
 
 # For embeddings and retrieval
 try:
@@ -28,8 +29,8 @@ try:
     import chromadb.utils.embedding_functions as embedding_functions
     from langchain.text_splitter import RecursiveCharacterTextSplitter
     from rank_bm25 import BM25Okapi
-except ImportError:
-    pass
+except ImportError as e:
+    print(f"Optional dependency missing: {e}")
 
 # Configure logging
 logging.basicConfig(
@@ -39,13 +40,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("VisDoMRAG")
 
-qa_prompts = {
-    "feta_tab": "You are a Wikipedia editor. Answer the question with a single, well-formed, factual sentence.",
-    "paper_tab": "You are a research scientist. Answer the question with a concise technical phrase.",
-    "scigraphqa": "You are a scientific researcher. Answer the question in 1-2 clear, evidence-based sentences.",
-    "slidevqa": "You are a presentation expert. Provide the exact answer to the question as it would appear on a slide. Be direct and precise.",
-    "spiqa": "You are a scientific paper author. Answer the question in 1-3 authoritative sentences."
-}
+# qa_prompts = {
+#     "feta_tab": "You are a Wikipedia editor. Answer the question with a single, well-formed, factual sentence.",
+#     "paper_tab": "You are a research scientist. Answer the question with a concise technical phrase.",
+#     "scigraphqa": "You are a scientific researcher. Answer the question in 1-2 clear, evidence-based sentences.",
+#     "slidevqa": "You are a presentation expert. Provide the exact answer to the question as it would appear on a slide. Be direct and precise.",
+#     "spiqa": "You are a scientific paper author. Answer the question in 1-3 authoritative sentences."
+# }
 
 class VisDoMRAG:
     def __init__(self, config):
@@ -66,7 +67,7 @@ class VisDoMRAG:
         self.chunk_size = config.get("chunk_size", 3000)
         self.chunk_overlap = config.get("chunk_overlap", 300)
         self.force_reindex = config.get("force_reindex", False)
-        self.qa_prompt = config.get("qa_prompt", "Answee the question objectively based on the context provided.")
+        self.qa_prompt = config.get("qa_prompt", "Answer the question objectively based on the context provided.")
         self.pdf_files = config.get("pdf_files", [])
         self.dataset_csv = config.get("csv_path")
         if not self.dataset_csv:
@@ -158,7 +159,7 @@ class VisDoMRAG:
                     self.vision_model = ColPali.from_pretrained(
                         "vidore/colpali-v1.2", 
                         torch_dtype=torch.bfloat16, 
-                        device_map="cuda"
+                        device_map="cuda:0"
                     ).eval()
                     self.vision_processor = ColPaliProcessor.from_pretrained("vidore/colpali-v1.2")
                 except ImportError:
@@ -173,8 +174,16 @@ class VisDoMRAG:
                         device_map="cuda"
                     ).eval()
                     self.vision_processor = ColQwen2Processor.from_pretrained("vidore/colqwen2-v0.1")
+                    # from colpali_engine.models import ColQwen2_5, ColQwen2_5_Processor
+                    # self.vision_model = ColQwen2_5.from_pretrained(
+                    #     "vidore/colqwen2.5-v0.2",
+                    #     torch_dtype=torch.bfloat16,
+                    #     device_map="cuda",  
+                    #     attn_implementation="flash_attention_2" 
+                    # ).eval()
+                    # self.visionprocessor = ColQwen2_5_Processor.from_pretrained("vidore/colqwen2.5-v0.2")
                 except ImportError:
-                    raise ImportError("ColPali/ColQwen models not found. Please install colpali_engine.")
+                    raise ImportError("ColQwen models not found. Please install colpali_engine.")
         else:
             raise ValueError(f"Unsupported visual retriever: {self.vision_retriever}")
     
@@ -209,23 +218,48 @@ class VisDoMRAG:
             list: List of text from each page
         """
         try:
-            # First try regular PDF extraction
-            with open(pdf_path, "rb") as file:
-                reader = PyPDF2.PdfReader(file, strict=False)
-                pages = [page.extract_text() for page in reader.pages]
-                
-            # If any page has no text, use OCR
-            if any(not page.strip() for page in pages):
-                logger.info(f"Using OCR for {pdf_path} as some pages have no text")
-                pages = []
-                pdf_images = convert_from_path(pdf_path)
-                for page_num, page_img in enumerate(pdf_images):
-                    text = pytesseract.image_to_string(page_img)
-                    pages.append(f"--- Page {page_num + 1} ---\n{text}\n")
-            
+            # Use DotsOCR to extract structured text from PDF
+            dots_output_dir = os.path.join(self.output_dir, "dots_ocr")
+            os.makedirs(dots_output_dir, exist_ok=True)
+
+            # Allow overriding DotsOCR parameters via config
+            dots_kwargs = {
+                "max_completion_tokens": self.config.get("dots_max_completion_tokens", 16384),
+                "num_thread": self.config.get("dots_num_thread", 16),
+                "dpi": self.config.get("dots_dpi", 200),
+                "output_dir": dots_output_dir,
+            }
+
+            logger.info(f"Using DotsOCR to extract text from PDF: {pdf_path}")
+            dots_ocr_parser = DotsOCRParser(**dots_kwargs)
+
+            prompt_mode = self.config.get("dots_prompt_mode", "prompt_layout_all_en")
+            results = dots_ocr_parser.parse_file(
+                pdf_path,
+                output_dir=dots_output_dir,
+                prompt_mode=prompt_mode,
+            )
+
+            pages = []
+            # Results are per page with 'page_no' and md_content_path/md_content_nohf_path
+            for res in sorted(results, key=lambda r: r.get("page_no", 0)):
+                md_path = res.get("md_content_path") or res.get("md_content_nohf_path")
+                page_no = res.get("page_no", len(pages)) + 1
+                page_text = ""
+                if md_path and os.path.exists(md_path):
+                    try:
+                        with open(md_path, "r", encoding="utf-8") as f:
+                            page_text = f.read()
+                    except Exception as read_err:
+                        logger.error(
+                            f"Error reading DotsOCR markdown for {pdf_path} page {page_no}: {read_err}"
+                        )
+                pages.append(f"--- Page {page_no} ---\n{page_text}\n")
+
             return pages
+
         except Exception as e:
-            logger.error(f"Error extracting text from {pdf_path}: {str(e)}")
+            logger.error(f"Error extracting text from {pdf_path} with DotsOCR: {str(e)}")
             traceback.print_exc()
             return []
     
@@ -910,9 +944,11 @@ class VisDoMRAG:
             self.cache_documents()
         all_chunks = []
         chunk_to_doc_mapping = []
-        for doc_id, pages in self.document_cache.items():
+        for doc_id, pages in tqdm(self.document_cache.items(), desc="Processing documents for text index"):
             all_text = "\n".join(pages)
+            print("[START]splitting text....")
             chunks = self.split_text(all_text)
+            print("[END]splitting text....")
             for chunk in chunks:
                 all_chunks.append(chunk)
                 arxiv_id, page_num = self.identify_document_and_page(chunk)
@@ -1032,10 +1068,9 @@ class VisDoMRAG:
             ___
             Question: {query}
             """
-            
+            base64_images = [self.encode_image(img) for img in images]
+
             if self.llm_model == "gpt4":
-                base64_images = [self.encode_image(img) for img in images]
-                
                 messages = [
                     {
                         "role": "user",
@@ -1044,11 +1079,13 @@ class VisDoMRAG:
                                 "type": "image_url",
                                 "image_url": {
                                     "url": f"data:image/jpeg;base64,{base64_image}"
+                                },
                                 }
-                            } for base64_image in base64_images
-                        ] + [
-                            {"type": "text", "text": prompt_template}
+                            for base64_image in base64_images
                         ]
+                        + [
+                            {"type": "text", "text": prompt_template},
+                        ],
                     }
                 ]
 
@@ -1056,16 +1093,35 @@ class VisDoMRAG:
                     model="chatgpt-4o-latest",
                     messages=messages,
                     max_tokens=3000,
-                    temperature=0.7
+                    temperature=0.7,
                 )
                 
                 return response.choices[0].message.content
                 
-            elif self.llm_model == "gemini":
-                multimodal_prompt = [prompt_template] + images
-                response = self.llm.generate_content(multimodal_prompt)
-                return response.text
-                
+            elif self.llm_model == "doubao":
+                # multimodal_prompt = [prompt_template] + images
+                response = self.llm.responses.create(
+                    model="doubao-seed-1-6-flash-250828",
+                    input=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_image",
+                                    "image_url": f"data:image/jpeg;base64,{base64_image}",
+                                }
+                                for base64_image in base64_images
+                            ]
+                            + [
+                                {
+                                    "type": "input_text",
+                                    "text": prompt_template,
+                                }
+                            ],
+                        }
+                    ],
+                )
+                return response.output[1].content[0].text
             elif self.llm_model == "qwen":
                 messages = [
                     {"role": "user", "content": [{"type": "image", "image": img} for img in images] + [{"type": "text", "text": prompt_template}]}
@@ -1073,7 +1129,7 @@ class VisDoMRAG:
                 
                 text = self.qwen_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
                 image_inputs, _ = self.process_vision_info(messages)
-                inputs = self.qwen_processor(text=[text], images=image_inputs, padding=True, return_tensors="pt").to("cuda")
+                inputs = self.qwen_processor(text=[text], images=image_inputs, padding=True, return_tensors="pt").to("cuda:0")
 
                 generated_ids = self.qwen_model.generate(**inputs, max_new_tokens=512)
                 generated_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
@@ -1137,9 +1193,28 @@ class VisDoMRAG:
                 )
                 return response.choices[0].message.content
                 
-            elif self.llm_model == "gemini":
-                response = self.llm.generate_content(prompt_template)
-                return response.text
+            elif self.llm_model == "doubao":
+                # Non-streaming:
+                print("----- standard request -----")
+                completion = self.llm.chat.completions.create(
+                    model="doubao-1-5-lite-32k-250115",
+                    messages=[
+                         {"role": "user", "content": prompt_template},
+                    ],
+                )
+                return completion.choices[0].message.content
+                # print("----- streaming request -----")
+                # stream = self.llm.chat.completions.create(
+                #     model="doubao-1-5-lite-32k-250115",
+                #     messages=[
+                #         {"role": "user", "content": prompt_template},
+                #     ],
+                #     stream=True,
+                # )
+                # for chunk in stream:
+                #     if not chunk.choices:
+                #         continue
+                #     print(chunk.choices[0].delta.content, end="")
                 
             elif self.llm_model == "qwen":
                 messages = [
@@ -1147,7 +1222,7 @@ class VisDoMRAG:
                 ]
                 
                 text = self.qwen_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                inputs = self.qwen_processor(text=[text], padding=True, return_tensors="pt").to("cuda")
+                inputs = self.qwen_processor(text=[text], padding=True, return_tensors="pt").to("cuda:0")
 
                 generated_ids = self.qwen_model.generate(**inputs, max_new_tokens=512)
                 generated_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
@@ -1189,7 +1264,7 @@ class VisDoMRAG:
         
         return sections
 
-    def combine_responses(self, query, visual_response, textual_response, answer):
+    def combine_responses(self, query, visual_response, textual_response, answer=None):
         """
         Combine visual and textual responses to generate a final answer.
         
@@ -1244,9 +1319,14 @@ class VisDoMRAG:
                 )
                 return self.parse_combined_output(response.choices[0].message.content)
                 
-            elif self.llm_model == "gemini":
-                response = self.llm.generate_content(prompt)
-                return self.parse_combined_output(response.text)
+            elif self.llm_model == "doubao":
+                combined_response = self.llm.chat.completions.create(
+                    model="doubao-1-5-lite-32k-250115",
+                    messages=[
+                         {"role": "user", "content": prompt},
+                    ],
+                )
+                return self.parse_combined_output(combined_response.choices[0].message.content)
                 
             elif self.llm_model == "qwen":
                 messages = [
@@ -1254,7 +1334,7 @@ class VisDoMRAG:
                 ]
                 
                 text = self.qwen_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                inputs = self.qwen_processor(text=[text], padding=True, return_tensors="pt").to("cuda")
+                inputs = self.qwen_processor(text=[text], padding=True, return_tensors="pt").to("cuda:0")
 
                 generated_ids = self.qwen_model.generate(**inputs, max_new_tokens=1000)
                 generated_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
@@ -1295,67 +1375,82 @@ class VisDoMRAG:
 
         return sections
 
-    def answer_question(self, question, answer=None):
+    def answer_question(self, question):
         try:
+            start_time = time.time()
+
+            logger.info("Step 1/5: Retrieving visual contexts...")
+            step_start = time.time()
             visual_contexts = self.retrieve_visual_contexts_for_question(question)
+            logger.info("Step 1/5 completed in %.2f seconds", time.time() - step_start)
             visual_response_dict = None
             if visual_contexts:
+                logger.info("Step 2/5: Generating visual response...")
+                step_start = time.time()
                 visual_response = self.generate_visual_response(question, visual_contexts)
+                logger.info("Step 2/5 completed in %.2f seconds", time.time() - step_start)
                 visual_response_dict = self.extract_sections(visual_response)
                 visual_response_dict.update(
                     {
                         "question": question,
                         "document": [ctx["document_id"] for ctx in visual_contexts],
-                        "gt_answer": answer,
                         "pages": [ctx["page_number"] for ctx in visual_contexts],
                     }
                 )
+            logger.info("Step 3/5: Retrieving textual contexts...")
+            step_start = time.time()
             textual_contexts = self.retrieve_textual_contexts_for_question(question)
+            logger.info("Step 3/5 completed in %.2f seconds", time.time() - step_start)
             textual_response_dict = None
             if textual_contexts:
+                logger.info("Step 4/5: Generating textual response...")
+                step_start = time.time()
                 textual_response = self.generate_textual_response(question, textual_contexts)
+                logger.info("Step 4/5 completed in %.2f seconds", time.time() - step_start)
                 textual_response_dict = self.extract_sections(textual_response)
                 textual_response_dict.update(
                     {
                         "question": question,
                         "document": [ctx["chunk_pdf_name"] for ctx in textual_contexts],
-                        "gt_answer": answer,
                         "pages": [ctx["pdf_page_number"] for ctx in textual_contexts],
                         "chunks": "\n".join([ctx["chunk"] for ctx in textual_contexts]),
                     }
                 )
             if visual_response_dict and textual_response_dict:
+                logger.info("Step 5/5: Combining responses...")
+                step_start = time.time()
                 combined_sections = self.combine_responses(
                     question,
                     visual_response_dict,
                     textual_response_dict,
-                    answer,
+                    None
                 )
+                logger.info("Step 5/5 completed in %.2f seconds", time.time() - step_start)
                 combined_response = {
                     "question": question,
                     "answer": combined_sections.get("Final Answer", ""),
-                    "gt_answer": answer,
                     "analysis": combined_sections.get("Analysis", ""),
                     "conclusion": combined_sections.get("Conclusion", ""),
                     "response1": visual_response_dict,
                     "response2": textual_response_dict,
                 }
+                logger.info("answer_question completed in %.2f seconds", time.time() - start_time)
                 return combined_response
             if visual_response_dict:
+                logger.info("answer_question completed in %.2f seconds (visual only)", time.time() - start_time)
                 return {
                     "question": question,
                     "answer": visual_response_dict.get("Answer", ""),
-                    "gt_answer": answer,
                     "analysis": visual_response_dict.get("Chain of Thought", ""),
                     "conclusion": "",
                     "response1": visual_response_dict,
                     "response2": textual_response_dict,
                 }
             if textual_response_dict:
+                logger.info("answer_question completed in %.2f seconds (textual only)", time.time() - start_time)
                 return {
                     "question": question,
                     "answer": textual_response_dict.get("Answer", ""),
-                    "gt_answer": answer,
                     "analysis": textual_response_dict.get("Chain of Thought", ""),
                     "conclusion": "",
                     "response1": visual_response_dict,

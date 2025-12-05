@@ -137,8 +137,10 @@ dmypy.json
 data/
 faiss_index/
 job/
+OCR*/
 # for MacOS
 *.DS_Store
+results/
 
 *.png
 dataset
