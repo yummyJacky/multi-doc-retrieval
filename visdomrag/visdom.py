@@ -171,19 +171,11 @@ class VisDoMRAG:
                     self.vision_model = ColQwen2.from_pretrained(
                         "vidore/colqwen2-v1.0", 
                         torch_dtype=torch.bfloat16, 
-                        device_map="cuda"
+                        device_map="cuda:0"
                     ).eval()
                     self.vision_processor = ColQwen2Processor.from_pretrained("vidore/colqwen2-v0.1")
-                    # from colpali_engine.models import ColQwen2_5, ColQwen2_5_Processor
-                    # self.vision_model = ColQwen2_5.from_pretrained(
-                    #     "vidore/colqwen2.5-v0.2",
-                    #     torch_dtype=torch.bfloat16,
-                    #     device_map="cuda",  
-                    #     attn_implementation="flash_attention_2" 
-                    # ).eval()
-                    # self.visionprocessor = ColQwen2_5_Processor.from_pretrained("vidore/colqwen2.5-v0.2")
                 except ImportError:
-                    raise ImportError("ColQwen models not found. Please install colpali_engine.")
+                    raise ImportError("ColPali/ColQwen models not found. Please install colpali_engine.")
         else:
             raise ValueError(f"Unsupported visual retriever: {self.vision_retriever}")
     
@@ -944,23 +936,24 @@ class VisDoMRAG:
             self.cache_documents()
         all_chunks = []
         chunk_to_doc_mapping = []
-        for doc_id, pages in tqdm(self.document_cache.items(), desc="Processing documents for text index"):
-            all_text = "\n".join(pages)
-            print("[START]splitting text....")
-            chunks = self.split_text(all_text)
-            print("[END]splitting text....")
-            for chunk in chunks:
-                all_chunks.append(chunk)
-                arxiv_id, page_num = self.identify_document_and_page(chunk)
-                chunk_to_doc_mapping.append(
-                    {
-                        "chunk": chunk,
-                        "chunk_pdf_name": arxiv_id if arxiv_id else doc_id,
-                        "pdf_page_number": page_num if page_num is not None else 0,
-                    }
-                )
+        # Build chunks per document and per page to avoid expensive identify_document_and_page
+        for doc_id, pages in self.document_cache.items():
+            for page_idx, page_text in tqdm(enumerate(pages), total=len(pages), desc=f"Processing pages for {doc_id}"):
+                page_chunks = self.split_text(page_text)
+                for chunk in page_chunks:
+                    all_chunks.append(chunk)
+                    chunk_to_doc_mapping.append(
+                        {
+                            "chunk": chunk,
+                            "chunk_pdf_name": doc_id,
+                            # Keep page index 0-based to align with visual index page indices
+                            "pdf_page_number": page_idx,
+                        }
+                    )
+        
         self._text_chunks = all_chunks
         self._text_chunk_mapping = chunk_to_doc_mapping
+        logger.info(f"Built interactive text index with {len(all_chunks)} chunks")
         if self.text_retriever == "bm25":
             self._bm25_model = BM25Okapi([chunk.split() for chunk in all_chunks])
         elif self.text_retriever in ["minilm", "mpnet", "bge"]:
