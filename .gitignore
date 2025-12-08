@@ -141,14 +141,13 @@ OCR*/
 # for MacOS
 *.DS_Store
 results/
-
 *.png
 dataset
 multimodalqa_screenshots
 *.json
 *.pdf
 *.jsonl*
-
+contents/
 setup_BCOS_README.md
 
 .env
