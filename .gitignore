@@ -149,6 +149,7 @@ multimodalqa_screenshots
 *.jsonl*
 contents/
 setup_BCOS_README.md
+deepseek_ocr_app/
 
 .env
 READDME copy.md

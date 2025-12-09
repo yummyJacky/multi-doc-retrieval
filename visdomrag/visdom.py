@@ -1,4 +1,5 @@
 import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 import json
 import torch
 import pandas as pd
@@ -17,12 +18,15 @@ import requests
 from PIL import Image
 import gc
 from difflib import SequenceMatcher
-import PyPDF2
-import pytesseract
 import traceback
 from openai import OpenAI
 from dots_ocr.parser import DotsOCRParser
-from transformers import AutoModel
+from transformers import AutoModel, AutoTokenizer
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import tempfile
+import shutil
+from visual_rag import VisualRAGEngine 
+from textual_rag import TextualRAGEngine 
 
 # For embeddings and retrieval
 try:
@@ -41,1321 +45,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("VisDoMRAG")
 
-
-class VisualRAGEngine:
-    def __init__(self, parent):
-        """Engine responsible for visual retrieval and visual QA."""
-        self.parent = parent
-        self.config = parent.config
-        self.data_dir = parent.data_dir
-        self.output_dir = parent.output_dir
-        self.llm_model = parent.llm_model
-        self.vision_retriever = parent.vision_retriever
-        self.top_k = parent.top_k
-        self.force_reindex = parent.force_reindex
-        self.qa_prompt = parent.qa_prompt
-        self.pdf_files = parent.pdf_files
-        self.df = parent.df
-        self.api_keys = parent.api_keys
-
-        # Copy LLM-related handles from parent
-        if hasattr(parent, "client"):
-            self.client = parent.client
-        if hasattr(parent, "llm"):
-            self.llm = parent.llm
-        if hasattr(parent, "qwen_model"):
-            self.qwen_model = parent.qwen_model
-        if hasattr(parent, "qwen_processor"):
-            self.qwen_processor = parent.qwen_processor
-        if hasattr(parent, "process_vision_info"):
-            self.process_vision_info = parent.process_vision_info
-
-        # Visual retrieval resources (supporting ColPali/ColQwen and Nvidia NemoRetriever)
-        self.vision_retrieval_file = (
-            f"{self.data_dir}/retrieval/retrieval_{self.vision_retriever}.csv"
-        )
-
-        # Model / processor handles
-        self.vision_model = None
-        self.vision_processor = None
-
-        # Keep original ColPali / ColQwen flows, and add Nemo as an alternative
-        if self.vision_retriever in ["colpali", "colqwen"]:
-            try:
-                if self.vision_retriever == "colpali":
-                    from colpali_engine.models import ColPali, ColPaliProcessor
-
-                    logger.info("Loading ColPali model for visual indexing")
-                    self.vision_model = ColPali.from_pretrained(
-                        "vidore/colpali-v1.2",
-                        torch_dtype=torch.bfloat16,
-                        device_map="cuda",
-                    ).eval()
-                    self.vision_processor = ColPaliProcessor.from_pretrained(
-                        "vidore/colpali-v1.2"
-                    )
-                else:  # colqwen
-                    from colpali_engine.models import ColQwen2, ColQwen2Processor
-
-                    logger.info("Loading ColQwen model for visual indexing")
-                    self.vision_model = ColQwen2.from_pretrained(
-                        "vidore/colqwen2-v1.0",
-                        torch_dtype=torch.bfloat16,
-                        device_map="cuda",
-                    ).eval()
-                    self.vision_processor = ColQwen2Processor.from_pretrained(
-                        "vidore/colqwen2-v0.1"
-                    )
-            except ImportError:
-                raise ImportError(
-                    "ColPali/ColQwen models not found. Please install colpali_engine."
-                )
-        elif self.vision_retriever in ["nemo", "nvidia", "nemo_retriever"]:
-            try:
-                logger.info(
-                    "Loading Nvidia NemoRetriever model 'nvidia/llama-nemoretriever-colembed-1b-v1' for visual indexing"
-                )
-                self.vision_model = AutoModel.from_pretrained(
-                    "nvidia/llama-nemoretriever-colembed-1b-v1",
-                    device_map="cuda",
-                    trust_remote_code=True,
-                    torch_dtype=torch.bfloat16,
-                    attn_implementation="flash_attention_2",
-                    revision="1f0fdea7f5b19532a750be109b19072d719b8177",
-                ).eval()
-            except ImportError as e:
-                raise ImportError(
-                    f"Failed to import transformers for Nvidia NemoRetriever: {e}. Please install 'transformers'."
-                )
-            except Exception as e:
-                logger.error("Error loading Nvidia NemoRetriever model: %s", str(e))
-                raise
-        else:
-            raise ValueError(f"Unsupported visual retriever: {self.vision_retriever}")
-
-        # Interactive visual index state
-        self._visual_index_built = False
-        self._page_embeddings = None  # Tensor of shape [n_pages, n_tokens, dim]
-        self._page_ids = []
-        self._page_info = {}
-
-    def build_visual_index(self):
-        """Build visual embedding index for all PDFs in the dataset using multi-vector scoring."""
-        logger.info(f"Building visual index using {self.vision_retriever}")
-
-        try:
-            pdf_dir = os.path.join(self.data_dir, "docs")
-            output_dir = os.path.join(self.data_dir, "visual_embeddings")
-            os.makedirs(output_dir, exist_ok=True)
-
-            # Extract unique document IDs from the dataset
-            unique_docs = set()
-            for _, row in self.df.iterrows():
-                try:
-                    docs = eval(row["documents"]) if "documents" in row else []
-                    unique_docs.update(docs)
-                except Exception:
-                    traceback.print_exc()
-                    pass
-
-                if "doc_path" in row:
-                    doc_path = row["doc_path"]
-                    if isinstance(doc_path, str) and doc_path.strip():
-                        unique_docs.add(os.path.basename(doc_path))
-
-            # Get list of PDF files based on unique_docs
-            pdf_files = []
-            for doc_id in unique_docs:
-                if doc_id.endswith(".pdf"):
-                    pdf_files.append(doc_id)
-                else:
-                    pdf_files.append(f"{doc_id}.pdf")
-
-            results = []
-
-            # --- Branch 1: original ColPali / ColQwen multi-vector flow ---
-            if self.vision_retriever in ["colpali", "colqwen"]:
-                if self.vision_processor is None or self.vision_model is None:
-                    raise RuntimeError(
-                        "ColPali/ColQwen vision model or processor is not initialized."
-                    )
-
-                page_embeddings = {}
-
-                # Process each PDF
-                for pdf_file in tqdm(pdf_files, desc="Processing PDFs for visual index"):
-                    doc_id = os.path.splitext(pdf_file)[0]
-                    pdf_path = os.path.join(pdf_dir, pdf_file)
-
-                    if not os.path.exists(pdf_path):
-                        logger.warning(f"PDF file not found: {pdf_path}")
-                        continue
-
-                    try:
-                        pages = convert_from_path(pdf_path)
-                    except Exception as e:
-                        logger.error(
-                            f"Error converting PDF {pdf_file} to images: {str(e)}"
-                        )
-                        traceback.print_exc()
-                        continue
-
-                    for page_idx, page_img in enumerate(pages):
-                        page_id = f"{doc_id}_{page_idx}"
-                        try:
-                            processed_image = self.vision_processor.process_images([page_img])
-                            processed_image = {
-                                k: v.to(self.vision_model.device)
-                                for k, v in processed_image.items()
-                            }
-                            with torch.no_grad():
-                                embedding = self.vision_model(**processed_image)
-
-                            # Save embedding to file (keep original behavior)
-                            embedding_file = os.path.join(
-                                output_dir, f"{page_id}.pt"
-                            )
-                            torch.save(embedding.cpu(), embedding_file)
-
-                            # Cache for multi-vector scoring
-                            page_embeddings[page_id] = embedding.cpu()
-                        except Exception as e:
-                            logger.error(
-                                f"Error processing page {page_idx} of PDF {pdf_file}: {str(e)}"
-                            )
-                            traceback.print_exc()
-                            continue
-
-                # Generate query embeddings
-                query_embeddings = {}
-                for _, row in tqdm(
-                    self.df.iterrows(), desc="Processing queries for visual index"
-                ):
-                    q_id = row["q_id"]
-                    question = row["question"]
-
-                    try:
-                        processed_query = self.vision_processor.process_queries([question])
-                        processed_query = {
-                            k: v.to(self.vision_model.device)
-                            for k, v in processed_query.items()
-                        }
-                        with torch.no_grad():
-                            embedding = self.vision_model(**processed_query)
-
-                        query_embeddings[q_id] = embedding.cpu()
-
-                        # Save query embedding
-                        query_embedding_file = os.path.join(
-                            output_dir, f"query_{q_id}.pt"
-                        )
-                        torch.save(embedding.cpu(), query_embedding_file)
-                    except Exception as e:
-                        logger.error(
-                            f"Error generating embedding for query {q_id}: {str(e)}"
-                        )
-                        traceback.print_exc()
-
-                # Multi-vector scoring per query
-                for _, row in tqdm(
-                    self.df.iterrows(), desc="Ranking documents for queries"
-                ):
-                    q_id = row["q_id"]
-                    question = row["question"]
-
-                    query_emb = query_embeddings.get(q_id)
-                    if query_emb is None:
-                        continue
-
-                    relevant_docs = []
-                    if "documents" in row:
-                        try:
-                            docs = eval(row["documents"])
-                            relevant_docs = [doc.split(".pdf")[0] for doc in docs]
-                        except Exception:
-                            traceback.print_exc()
-                            relevant_docs = [
-                                os.path.splitext(f)[0] for f in pdf_files
-                            ]
-
-                    if not relevant_docs:
-                        relevant_docs = [os.path.splitext(f)[0] for f in pdf_files]
-
-                    relevant_page_embeddings = {}
-                    for page_id, embedding in page_embeddings.items():
-                        doc_id = page_id.rsplit("_", 1)[0]
-                        if doc_id in relevant_docs:
-                            relevant_page_embeddings[page_id] = embedding
-
-                    if not relevant_page_embeddings:
-                        logger.warning(
-                            f"No relevant document embeddings found for query {q_id}"
-                        )
-                        continue
-
-                    qs = query_emb
-                    ds = torch.cat(
-                        [emb for emb in relevant_page_embeddings.values()], dim=0
-                    )
-
-                    try:
-                        scores = self.vision_processor.score_multi_vector(qs, ds)
-                        scores = scores.flatten().numpy()
-                    except Exception as e:
-                        logger.error(
-                            f"Error scoring documents for query {q_id}: {str(e)}"
-                        )
-                        traceback.print_exc()
-                        continue
-
-                    top_indices = np.argsort(-scores)
-                    ranked_docs = np.array(
-                        list(relevant_page_embeddings.keys())
-                    )[top_indices]
-
-                    for doc_id, score in zip(ranked_docs, scores[top_indices]):
-                        results.append(
-                            {
-                                "q_id": q_id,
-                                "document_id": doc_id,
-                                "score": float(score),
-                                "question": question,
-                            }
-                        )
-
-            # --- Branch 2: Nvidia NemoRetriever multi-vector flow ---
-            elif self.vision_retriever in ["nemo", "nvidia", "nemo_retriever"]:
-                # Track all generated embeddings
-                page_ids = []
-                page_embeddings_list = []  # list of [n_tokens, dim]
-
-                # Process each PDF
-                for pdf_file in tqdm(pdf_files, desc="Processing PDFs for visual index"):
-                    doc_id = os.path.splitext(pdf_file)[0]
-                    pdf_path = os.path.join(pdf_dir, pdf_file)
-
-                    # Skip if file doesn't exist
-                    if not os.path.exists(pdf_path):
-                        logger.warning(f"PDF file not found: {pdf_path}")
-                        continue
-
-                    # Convert PDF to images
-                    try:
-                        pages = convert_from_path(pdf_path)
-                    except Exception as e:
-                        logger.error(
-                            f"Error converting PDF {pdf_file} to images: {str(e)}"
-                        )
-                        traceback.print_exc()
-                        continue
-
-                    if not pages:
-                        continue
-
-                    # Encode all pages of this PDF with NemoRetriever
-                    try:
-                        with torch.no_grad():
-                            passage_embeddings = self.vision_model.forward_passages(
-                                pages, batch_size=8
-                            )
-                        passage_embeddings = passage_embeddings.cpu()
-                    except Exception as e:
-                        logger.error(
-                            f"Error encoding pages for PDF {pdf_file} with NemoRetriever: {str(e)}"
-                        )
-                        traceback.print_exc()
-                        continue
-
-                    # Store per-page embeddings
-                    for page_idx in range(len(pages)):
-                        page_id = f"{doc_id}_{page_idx}"
-                        page_ids.append(page_id)
-                        page_embeddings_list.append(passage_embeddings[page_idx])
-
-                if not page_embeddings_list:
-                    logger.warning(
-                        "No page embeddings were generated for visual index."
-                    )
-                    return False
-
-                # Stack to a single tensor [n_pages, n_tokens, dim]
-                page_embeddings = torch.stack(page_embeddings_list, dim=0)
-
-                # Generate query embeddings
-                query_embeddings = {}
-                for _, row in tqdm(
-                    self.df.iterrows(), desc="Processing queries for visual index"
-                ):
-                    q_id = row["q_id"]
-                    question = row["question"]
-
-                    try:
-                        with torch.no_grad():
-                            q_emb = self.vision_model.forward_queries(
-                                [question], batch_size=1
-                            )
-                        query_embeddings[q_id] = q_emb.cpu()
-                    except Exception as e:
-                        logger.error(
-                            f"Error generating embedding for query {q_id}: {str(e)}"
-                        )
-                        traceback.print_exc()
-
-                # Use NemoRetriever get_scores to rank documents for each query
-                for _, row in tqdm(
-                    self.df.iterrows(), desc="Ranking documents for queries"
-                ):
-                    q_id = row["q_id"]
-                    question = row["question"]
-
-                    query_emb = query_embeddings.get(q_id)
-                    if query_emb is None:
-                        continue
-
-                    # Get relevant documents for this query based on the dataset
-                    relevant_docs = []
-                    if "documents" in row:
-                        try:
-                            docs = eval(row["documents"])
-                            relevant_docs = [doc.split(".pdf")[0] for doc in docs]
-                        except Exception:
-                            # If documents field is not valid, use all documents
-                            traceback.print_exc()
-                            relevant_docs = [
-                                os.path.splitext(f)[0] for f in pdf_files
-                            ]
-
-                    if not relevant_docs:
-                        relevant_docs = [os.path.splitext(f)[0] for f in pdf_files]
-
-                    # Select candidate pages
-                    candidate_indices = []
-                    candidate_page_ids = []
-                    for idx, pid in enumerate(page_ids):
-                        doc_id = pid.rsplit("_", 1)[0]
-                        if doc_id in relevant_docs:
-                            candidate_indices.append(idx)
-                            candidate_page_ids.append(pid)
-
-                    if not candidate_indices:
-                        logger.warning(
-                            f"No relevant document embeddings found for query {q_id}"
-                        )
-                        continue
-
-                    candidate_embeddings = page_embeddings[candidate_indices]
-
-                    try:
-                        with torch.no_grad():
-                            scores = self.vision_model.get_scores(
-                                query_emb, candidate_embeddings
-                            )
-                        query_scores = scores[0].cpu().numpy()
-                    except Exception as e:
-                        logger.error(
-                            f"Error ranking documents for query {q_id}: {str(e)}"
-                        )
-                        traceback.print_exc()
-                        continue
-
-                    # Get indices of scores in descending order
-                    top_indices = np.argsort(-query_scores)
-
-                    # Store results for each ranked document
-                    for idx in top_indices:
-                        doc_page_id = candidate_page_ids[idx]
-                        score = float(query_scores[idx])
-                        results.append(
-                            {
-                                "q_id": q_id,
-                                "document_id": doc_page_id,
-                                "score": score,
-                                "question": question,
-                            }
-                        )
-            else:
-                raise ValueError(f"Unsupported visual retriever: {self.vision_retriever}")
-
-            # Save results to CSV
-            with open(self.vision_retrieval_file, "w", newline="") as csvfile:
-                fieldnames = ["q_id", "document_id", "score", "question"]
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(results)
-
-            logger.info(f"Visual index saved to {self.vision_retrieval_file}")
-            return True
-
-        except Exception as e:
-            logger.error(f"Error building visual index: {str(e)}")
-            traceback.print_exc()
-            return False
-
-    def retrieve_visual_contexts(self, query_id):
-        """Retrieve visual contexts (images) for a benchmark query by ID."""
-        try:
-            # Check if we need to build the index
-            if not os.path.exists(self.vision_retrieval_file) or self.force_reindex:
-                logger.info(
-                    "Visual index not found or force reindex is enabled. Building index..."
-                )
-                if not self.build_visual_index():
-                    return []
-
-            # Load the retrieval results
-            df_retrieval = pd.read_csv(self.vision_retrieval_file)
-
-            # Filter for the current query
-            query_rows = df_retrieval[df_retrieval["q_id"] == query_id]
-            if len(query_rows) == 0:
-                logger.warning(f"No visual contexts found for query {query_id}")
-                return []
-
-            # Get top-k visual contexts
-            top_k_rows = query_rows.nlargest(self.top_k, "score")
-
-            # Load the images from PDFs
-            pages = []
-            pdf_dir = os.path.join(self.data_dir, "docs")
-
-            for _, row in top_k_rows.iterrows():
-                try:
-                    document_id = row["document_id"]
-                    # Extract base document ID and page number
-                    base_doc_id, page_number = document_id.rsplit("_", 1)
-                    page_number = int(page_number)
-
-                    # Find the PDF file
-                    pdf_path = os.path.join(pdf_dir, f"{base_doc_id}.pdf")
-                    if not os.path.exists(pdf_path):
-                        logger.warning(f"PDF file not found: {pdf_path}")
-                        continue
-
-                    # Convert PDF page to image
-                    pdf_images = convert_from_path(pdf_path)
-                    if page_number >= len(pdf_images):
-                        logger.warning(
-                            f"Page {page_number} out of range for {pdf_path}"
-                        )
-                        continue
-
-                    image = pdf_images[page_number]
-                    pages.append(
-                        {
-                            "image": image,
-                            "document_id": document_id,
-                            "page_number": page_number,
-                        }
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"Error loading PDF page for {row['document_id']}: {str(e)}"
-                    )
-                    traceback.print_exc()
-
-            logger.info(f"Retrieved {len(pages)} visual contexts for query {query_id}")
-            return pages
-
-        except Exception as e:
-            logger.error(f"Error retrieving visual contexts for query {query_id}: {str(e)}")
-            traceback.print_exc()
-            return []
-
-    def _build_interactive_visual_index(self):
-        if self._visual_index_built:
-            return
-        if not self.pdf_files:
-            logger.warning("pdf_files not provided for interactive visual index")
-            self._visual_index_built = False
-            return
-        pdf_paths = self.parent._get_config_pdf_paths()
-        if not pdf_paths:
-            logger.warning("No valid PDF files for interactive visual index")
-            self._visual_index_built = False
-            return
-        # ColPali / ColQwen interactive index
-        if self.vision_retriever in ["colpali", "colqwen"]:
-            page_embeddings = {}
-            page_info = {}
-            for doc_id, pdf_path in tqdm(
-                pdf_paths.items(), desc="Processing PDFs for interactive visual index"
-            ):
-                try:
-                    pages = convert_from_path(pdf_path)
-                except Exception as e:
-                    logger.error(
-                        f"Error converting PDF {pdf_path} to images: {str(e)}"
-                    )
-                    traceback.print_exc()
-                    continue
-                for page_idx, page_img in enumerate(pages):
-                    page_id = f"{doc_id}_{page_idx}"
-                    try:
-                        processed_image = self.vision_processor.process_images([page_img])
-                        processed_image = {
-                            k: v.to(self.vision_model.device)
-                            for k, v in processed_image.items()
-                        }
-                        with torch.no_grad():
-                            embedding = self.vision_model(**processed_image)
-                        page_embeddings[page_id] = embedding.cpu()
-                        page_info[page_id] = {
-                            "doc_id": doc_id,
-                            "page_idx": page_idx,
-                            "pdf_path": pdf_path,
-                        }
-                    except Exception as e:
-                        logger.error(
-                            f"Error processing page {page_idx} of PDF {pdf_path}: {str(e)}"
-                        )
-                        traceback.print_exc()
-                        continue
-            self._page_embeddings = page_embeddings
-            self._page_info = page_info
-            self._page_ids = list(page_embeddings.keys())
-            self._visual_index_built = True
-
-        # Nemo interactive index
-        elif self.vision_retriever in ["nemo", "nvidia", "nemo_retriever"]:
-            page_embeddings_list = []
-            page_ids = []
-            page_info = {}
-            for doc_id, pdf_path in tqdm(
-                pdf_paths.items(), desc="Processing PDFs for interactive visual index"
-            ):
-                try:
-                    pages = convert_from_path(pdf_path)
-                except Exception as e:
-                    logger.error(
-                        f"Error converting PDF {pdf_path} to images: {str(e)}"
-                    )
-                    traceback.print_exc()
-                    continue
-
-                if not pages:
-                    continue
-
-                try:
-                    with torch.no_grad():
-                        passage_embeddings = self.vision_model.forward_passages(
-                            pages, batch_size=8
-                        )
-                    passage_embeddings = passage_embeddings.cpu()
-                except Exception as e:
-                    logger.error(
-                        "Error encoding pages for interactive visual index with NemoRetriever: %s",
-                        str(e),
-                    )
-                    traceback.print_exc()
-                    continue
-
-                for page_idx, page_img in enumerate(pages):
-                    page_id = f"{doc_id}_{page_idx}"
-                    page_ids.append(page_id)
-                    page_embeddings_list.append(passage_embeddings[page_idx])
-                    page_info[page_id] = {
-                        "doc_id": doc_id,
-                        "page_idx": page_idx,
-                        "pdf_path": pdf_path,
-                    }
-
-            if not page_embeddings_list:
-                logger.warning("No visual embeddings available for interactive index")
-                self._visual_index_built = False
-                return
-
-            self._page_embeddings = torch.stack(page_embeddings_list, dim=0)
-            self._page_ids = page_ids
-            self._page_info = page_info
-            self._visual_index_built = True
-        else:
-            raise ValueError(f"Unsupported visual retriever: {self.vision_retriever}")
-
-    def retrieve_visual_contexts_for_question(self, query):
-        try:
-            self._build_interactive_visual_index()
-            if not self._visual_index_built:
-                return []
-            # ColPali / ColQwen interactive retrieval
-            if self.vision_retriever in ["colpali", "colqwen"]:
-                if not self._page_embeddings:
-                    return []
-                page_ids = list(self._page_embeddings.keys())
-                if not page_ids:
-                    logger.warning(
-                        "No visual embeddings available for interactive retrieval"
-                    )
-                    return []
-                try:
-                    processed_query = self.vision_processor.process_queries([query])
-                    processed_query = {
-                        k: v.to(self.vision_model.device)
-                        for k, v in processed_query.items()
-                    }
-                    with torch.no_grad():
-                        query_emb = self.vision_model(**processed_query)
-                except Exception as e:
-                    logger.error(
-                        "Error generating query embedding for interactive visual retrieval: %s",
-                        str(e),
-                    )
-                    traceback.print_exc()
-                    return []
-                ds = torch.cat(
-                    [self._page_embeddings[pid] for pid in page_ids], dim=0
-                )
-                if len(ds) == 0:
-                    logger.warning("No visual embeddings to score")
-                    return []
-                scores = self.vision_processor.score_multi_vector(query_emb, ds)
-                scores = scores.flatten().numpy()
-                top_indices = np.argsort(-scores)[: self.top_k]
-                selected_page_ids = np.array(page_ids)[top_indices]
-            # Nemo interactive retrieval
-            elif self.vision_retriever in ["nemo", "nvidia", "nemo_retriever"]:
-                if self._page_embeddings is None or not self._page_ids:
-                    return []
-                try:
-                    with torch.no_grad():
-                        query_emb = self.vision_model.forward_queries(
-                            [query], batch_size=1
-                        )
-                    query_emb = query_emb.cpu()
-                except Exception as e:
-                    logger.error(
-                        "Error generating query embedding for interactive visual retrieval: %s",
-                        str(e),
-                    )
-                    traceback.print_exc()
-                    return []
-
-                try:
-                    with torch.no_grad():
-                        scores = self.vision_model.get_scores(
-                            query_emb, self._page_embeddings
-                        )
-                    query_scores = scores[0].cpu().numpy()
-                except Exception as e:
-                    logger.error(
-                        "Error scoring interactive visual retrieval with NemoRetriever: %s",
-                        str(e),
-                    )
-                    traceback.print_exc()
-                    return []
-
-                if len(query_scores) == 0:
-                    logger.warning("No visual embeddings to score")
-                    return []
-
-                top_indices = np.argsort(-query_scores)[: self.top_k]
-                selected_page_ids = [
-                    self._page_ids[idx]
-                    for idx in top_indices
-                    if 0 <= idx < len(self._page_ids)
-                ]
-            else:
-                raise ValueError(f"Unsupported visual retriever: {self.vision_retriever}")
-
-            pages = []
-            for page_id in selected_page_ids:
-                info = self._page_info.get(page_id)
-                if not info:
-                    continue
-                pdf_path = info["pdf_path"]
-                page_idx = info["page_idx"]
-                try:
-                    pdf_images = convert_from_path(pdf_path)
-                    if page_idx >= len(pdf_images):
-                        logger.warning(f"Page {page_idx} out of range for {pdf_path}")
-                        continue
-                    image = pdf_images[page_idx]
-                    pages.append(
-                        {
-                            "image": image,
-                            "document_id": page_id,
-                            "page_number": page_idx,
-                        }
-                    )
-                except Exception as e:
-                    logger.error(f"Error loading PDF page for {page_id}: {str(e)}")
-                    traceback.print_exc()
-                    continue
-            logger.info(
-                "Retrieved %d visual contexts for interactive query", len(pages)
-            )
-            return pages
-        except Exception as e:
-            logger.error(
-                "Error retrieving visual contexts for interactive query: %s", str(e)
-            )
-            traceback.print_exc()
-            return []
-
-    def encode_image(self, pil_image):
-        """Encode a PIL image to base64 string."""
-        buffered = BytesIO()
-        pil_image.save(buffered, format="JPEG")
-        img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-        return img_str
-
-    def generate_visual_response(self, query, visual_contexts):
-        """Generate a response based on visual contexts."""
-        try:
-            # Extract just the images
-            images = [ctx["image"] for ctx in visual_contexts]
-
-            # Create prompt
-            prompt_template = f"""
-            You are tasked with answering a question based on the relevant pages of a PDF document. Provide your response in the following format:
-            ## Evidence:
-
-            ## Chain of Thought:
-
-            ## Answer:
-
-            ___
-            Instructions:
-
-            1. Evidence Curation: Extract relevant elements (such as paragraphs, tables, figures, charts) from the provided pages and populate them in the "Evidence" section. For each element, include the type, content, and a brief explanation of its relevance.
-
-            2. Chain of Thought: In the "Chain of Thought" section, list out each logical step you take to derive the answer, referencing the evidence where applicable. You should perform computations if you need to to get to the answer. 
-
-            3. Answer: {self.qa_prompt}
-            ___
-            Question: {query}
-            """
-            base64_images = [self.encode_image(img) for img in images]
-
-            if self.llm_model == "gpt4":
-                messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{base64_image}",
-                                },
-                            }
-                            for base64_image in base64_images
-                        ]
-                        + [
-                            {"type": "text", "text": prompt_template},
-                        ],
-                    }
-                ]
-
-                response = self.client.chat.completions.create(
-                    model="chatgpt-4o-latest",
-                    messages=messages,
-                    max_tokens=3000,
-                    temperature=0.7,
-                )
-
-                return response.choices[0].message.content
-
-            elif self.llm_model == "doubao":
-                response = self.llm.responses.create(
-                    model="doubao-seed-1-6-flash-250828",
-                    input=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "input_image",
-                                    "image_url": f"data:image/jpeg;base64,{base64_image}",
-                                }
-                                for base64_image in base64_images
-                            ]
-                            + [
-                                {
-                                    "type": "input_text",
-                                    "text": prompt_template,
-                                }
-                            ],
-                        }
-                    ],
-                )
-                return response.output[1].content[0].text
-            elif self.llm_model == "qwen":
-                messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "image": img} for img in images
-                        ]
-                        + [{"type": "text", "text": prompt_template}],
-                    }
-                ]
-
-                text = self.qwen_processor.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
-                image_inputs, _ = self.process_vision_info(messages)
-                inputs = self.qwen_processor(
-                    text=[text], images=image_inputs, padding=True, return_tensors="pt"
-                ).to("cuda:0")
-
-                generated_ids = self.qwen_model.generate(**inputs, max_new_tokens=512)
-                generated_ids_trimmed = [
-                    out_ids[len(in_ids) :]
-                    for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-                ]
-                output_text = self.qwen_processor.batch_decode(
-                    generated_ids_trimmed, skip_special_tokens=True
-                )
-
-                return output_text[0]
-
-        except Exception as e:
-            logger.error(f"Error generating visual response: {str(e)}")
-            traceback.print_exc()
-            return "Error generating response from visual contexts."
-
-
-class TextualRAGEngine:
-    def __init__(self, parent):
-        """Engine responsible for textual retrieval and textual QA."""
-        self.parent = parent
-        self.config = parent.config
-        self.data_dir = parent.data_dir
-        self.output_dir = parent.output_dir
-        self.llm_model = parent.llm_model
-        self.text_retriever = parent.text_retriever
-        self.top_k = parent.top_k
-        self.force_reindex = parent.force_reindex
-        self.qa_prompt = parent.qa_prompt
-        self.df = parent.df
-        self.api_keys = parent.api_keys
-
-        # Copy LLM-related handles from parent
-        if hasattr(parent, "client"):
-            self.client = parent.client
-        if hasattr(parent, "llm"):
-            self.llm = parent.llm
-        if hasattr(parent, "qwen_model"):
-            self.qwen_model = parent.qwen_model
-        if hasattr(parent, "qwen_processor"):
-            self.qwen_processor = parent.qwen_processor
-
-        # Text retrieval resources
-        self.text_retrieval_file = f"{self.data_dir}/retrieval/retrieval_{self.text_retriever}.csv"
-
-        if self.text_retriever == "bm25":
-            # No model needed for BM25
-            self.st_embedding_function = None
-        elif self.text_retriever in ["minilm", "mpnet", "bge"]:
-            # Map text_retriever to actual model names
-            model_map = {
-                "minilm": "sentence-transformers/all-MiniLM-L6-v2",
-                "mpnet": "sentence-transformers/all-mpnet-base-v2",
-                "bge": "BAAI/bge-base-en-v1.5",
-            }
-
-            # Load sentence transformer model
-            self.text_model_name = model_map[self.text_retriever]
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
-            self.st_embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
-                model_name=self.text_model_name, device=self.device
-            )
-        else:
-            raise ValueError(f"Unsupported text retriever: {self.text_retriever}")
-
-        # Interactive text index state
-        self._text_index_built = False
-        self._bm25_model = None
-        self._chroma_client = None
-        self._text_collection = None
-        self._text_chunks = []
-        self._text_chunk_mapping = []
-
-    def build_text_index(self):
-        """Build text index for all documents in the dataset."""
-        logger.info(f"Building text index using {self.text_retriever}")
-
-        try:
-            # Cache documents if not already done
-            if not self.parent.document_cache:
-                self.parent.cache_documents()
-
-            # Prepare all documents
-            all_chunks = []
-            chunk_to_doc_mapping = []
-
-            for doc_id, pages in tqdm(
-                self.parent.document_cache.items(),
-                desc="Processing documents for text index",
-            ):
-                all_text = "\n".join(pages)
-                chunks = self.parent.split_text(all_text)
-
-                for chunk in chunks:
-                    all_chunks.append(chunk)
-                    arxiv_id, page_num = self.parent.identify_document_and_page(chunk)
-                    chunk_to_doc_mapping.append(
-                        {
-                            "chunk": chunk,
-                            "chunk_pdf_name": arxiv_id if arxiv_id else doc_id,
-                            "pdf_page_number": page_num if page_num is not None else 0,
-                        }
-                    )
-
-            # Initialize retriever based on selected method
-            if self.text_retriever == "bm25":
-                # BM25 indexing
-                bm25_model = BM25Okapi([chunk.split() for chunk in all_chunks])
-
-                # Process each query
-                results = []
-                for _, row in tqdm(
-                    self.df.iterrows(), desc="Processing queries for BM25"
-                ):
-                    q_id = row["q_id"]
-                    question = row["question"]
-
-                    # Get BM25 scores
-                    try:
-                        scores = bm25_model.get_scores(question.split())
-                        top_indices = sorted(
-                            range(len(scores)),
-                            key=lambda i: scores[i],
-                            reverse=True,
-                        )[: self.top_k * 2]
-
-                        for rank, idx in enumerate(top_indices):
-                            chunk_info = chunk_to_doc_mapping[idx]
-                            results.append(
-                                {
-                                    "q_id": q_id,
-                                    "question": question,
-                                    "chunk": all_chunks[idx],
-                                    "chunk_pdf_name": chunk_info["chunk_pdf_name"],
-                                    "pdf_page_number": chunk_info["pdf_page_number"],
-                                    "rank": rank + 1,
-                                    "score": scores[idx],
-                                }
-                            )
-                    except Exception as e:
-                        logger.error(
-                            f"Error processing query {q_id} with BM25: {str(e)}"
-                        )
-                        traceback.print_exc()
-
-            elif self.text_retriever in ["minilm", "mpnet", "bge"]:
-                # Create Chroma collection with sentence transformer embeddings
-                chroma_client = chromadb.Client()
-                collection_name = f"st_col_{uuid.uuid4().hex[:8]}"
-                collection = chroma_client.create_collection(
-                    collection_name,
-                    embedding_function=self.st_embedding_function,
-                    metadata={"hnsw:space": "cosine"},
-                )
-
-                # Add documents to collection
-                collection.add(
-                    documents=all_chunks,
-                    ids=[f"chunk_{i}" for i in range(len(all_chunks))],
-                )
-
-                # Process each query
-                results = []
-                for _, row in tqdm(
-                    self.df.iterrows(),
-                    desc=f"Processing queries for {self.text_retriever.upper()}",
-                ):
-                    q_id = row["q_id"]
-                    question = row["question"]
-
-                    # Get nearest chunks
-                    try:
-                        query_results = collection.query(
-                            query_texts=[question],
-                            n_results=self.top_k * 2,
-                        )
-
-                        for rank, (chunk_idx, score) in enumerate(
-                            zip(
-                                [
-                                    int(id.split("_")[1])
-                                    for id in query_results["ids"][0]
-                                ],
-                                query_results["distances"][0],
-                            )
-                        ):
-                            chunk_info = chunk_to_doc_mapping[chunk_idx]
-                            results.append(
-                                {
-                                    "q_id": q_id,
-                                    "question": question,
-                                    "chunk": all_chunks[chunk_idx],
-                                    "chunk_pdf_name": chunk_info["chunk_pdf_name"],
-                                    "pdf_page_number": chunk_info["pdf_page_number"],
-                                    "rank": rank + 1,
-                                    "score": 1.0 - score,  # Convert distance to similarity
-                                }
-                            )
-                    except Exception as e:
-                        logger.error(
-                            f"Error processing query {q_id} with {self.text_retriever}: {str(e)}"
-                        )
-                        traceback.print_exc()
-
-            # Save results to CSV
-            with open(self.text_retrieval_file, "w", newline="") as csvfile:
-                fieldnames = [
-                    "q_id",
-                    "question",
-                    "chunk",
-                    "chunk_pdf_name",
-                    "pdf_page_number",
-                    "rank",
-                    "score",
-                ]
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(results)
-
-            logger.info(f"Text index saved to {self.text_retrieval_file}")
-            return True
-
-        except Exception as e:
-            logger.error(f"Error building text index: {str(e)}")
-            traceback.print_exc()
-            return False
-
-    def retrieve_textual_contexts(self, query_id):
-        """Retrieve textual contexts for a benchmark query by ID."""
-        try:
-            if not os.path.exists(self.text_retrieval_file) or self.force_reindex:
-                logger.info(
-                    "Textual index not found or force reindex is enabled. Building index..."
-                )
-                if not self.build_text_index():
-                    return []
-
-            retrieval_path = self.text_retrieval_file
-
-            df_retrieval = pd.read_csv(retrieval_path)
-
-            # Filter for the current query
-            query_rows = df_retrieval[df_retrieval["q_id"] == query_id]
-            if len(query_rows) == 0:
-                logger.warning(f"No textual contexts found for query {query_id}")
-                return []
-
-            # Get top-k textual contexts
-            top_k_rows = query_rows.sort_values(by="rank", ascending=True).head(
-                self.top_k
-            )
-
-            # Extract the contexts
-            contexts = []
-            for _, row in top_k_rows.iterrows():
-                contexts.append(
-                    {
-                        "chunk": row["chunk"],
-                        "chunk_pdf_name": row["chunk_pdf_name"]
-                        if "chunk_pdf_name" in row
-                        else row.get("document_id", "unknown"),
-                        "pdf_page_number": row["pdf_page_number"]
-                        if "pdf_page_number" in row
-                        else row.get("page_number", 0),
-                    }
-                )
-
-            logger.info(f"Retrieved {len(contexts)} textual contexts for query {query_id}")
-            return contexts
-
-        except Exception as e:
-            logger.error(f"Error retrieving textual contexts for query {query_id}: {str(e)}")
-            traceback.print_exc()
-            return []
-
-    def _build_interactive_text_index(self):
-        if self._text_index_built:
-            return
-        if not self.parent.document_cache:
-            self.parent.cache_documents()
-        all_chunks = []
-        chunk_to_doc_mapping = []
-        # Build chunks per document and per page to avoid expensive identify_document_and_page
-        for doc_id, pages in self.parent.document_cache.items():
-            for page_idx, page_text in tqdm(
-                enumerate(pages), total=len(pages), desc=f"Processing pages for {doc_id}"
-            ):
-                page_chunks = self.parent.split_text(page_text)
-                for chunk in page_chunks:
-                    all_chunks.append(chunk)
-                    chunk_to_doc_mapping.append(
-                        {
-                            "chunk": chunk,
-                            "chunk_pdf_name": doc_id,
-                            # Keep page index 0-based to align with visual index page indices
-                            "pdf_page_number": page_idx,
-                        }
-                    )
-
-        self._text_chunks = all_chunks
-        self._text_chunk_mapping = chunk_to_doc_mapping
-        logger.info(f"Built interactive text index with {len(all_chunks)} chunks")
-        if self.text_retriever == "bm25":
-            self._bm25_model = BM25Okapi([chunk.split() for chunk in all_chunks])
-        elif self.text_retriever in ["minilm", "mpnet", "bge"]:
-            chroma_client = chromadb.Client()
-            collection_name = f"st_col_{uuid.uuid4().hex[:8]}"
-            collection = chroma_client.create_collection(
-                collection_name,
-                embedding_function=self.st_embedding_function,
-                metadata={"hnsw:space": "cosine"},
-            )
-            collection.add(
-                documents=all_chunks,
-                ids=[f"chunk_{i}" for i in range(len(all_chunks))],
-            )
-            self._chroma_client = chroma_client
-            self._text_collection = collection
-        else:
-            raise ValueError(f"Unsupported text retriever: {self.text_retriever}")
-        self._text_index_built = True
-
-    def retrieve_textual_contexts_for_question(self, question):
-        try:
-            self._build_interactive_text_index()
-            if not self._text_index_built:
-                return []
-            contexts = []
-            if self.text_retriever == "bm25":
-                scores = self._bm25_model.get_scores(question.split())
-                top_indices = sorted(
-                    range(len(scores)), key=lambda i: scores[i], reverse=True
-                )[: self.top_k]
-                for idx in top_indices:
-                    chunk_info = self._text_chunk_mapping[idx]
-                    contexts.append(
-                        {
-                            "chunk": self._text_chunks[idx],
-                            "chunk_pdf_name": chunk_info["chunk_pdf_name"],
-                            "pdf_page_number": chunk_info["pdf_page_number"],
-                        }
-                    )
-            elif self.text_retriever in ["minilm", "mpnet", "bge"]:
-                query_results = self._text_collection.query(
-                    query_texts=[question],
-                    n_results=self.top_k,
-                )
-                for chunk_idx, score in zip(
-                    [int(id.split("_")[1]) for id in query_results["ids"][0]],
-                    query_results["distances"][0],
-                ):
-                    chunk_info = self._text_chunk_mapping[chunk_idx]
-                    contexts.append(
-                        {
-                            "chunk": self._text_chunks[chunk_idx],
-                            "chunk_pdf_name": chunk_info["chunk_pdf_name"],
-                            "pdf_page_number": chunk_info["pdf_page_number"],
-                        }
-                    )
-            else:
-                return []
-            logger.info(
-                "Retrieved %d textual contexts for interactive query", len(contexts)
-            )
-            return contexts
-        except Exception as e:
-            logger.error(
-                "Error retrieving textual contexts for interactive query: %s", str(e)
-            )
-            traceback.print_exc()
-            return []
-
-    def generate_textual_response(self, query, textual_contexts):
-        """Generate a response based on textual contexts."""
-        try:
-            # Extract the text chunks
-            contexts = [ctx["chunk"] for ctx in textual_contexts]
-            contexts_str = "\n- ".join(contexts)
-
-            # Create prompt
-            prompt_template = f"""
-            You are tasked with answering a question based on the relevant chunks of a PDF document. Provide your response in the following format:
-            ## Evidence:
-
-            ## Chain of Thought:
-
-            ## Answer:
-
-            ___
-            Instructions:
-
-            1. Evidence Curation: Extract relevant elements (such as paragraphs, tables, figures, charts) from the provided chunks and populate them in the "Evidence" section. For each element, include the type, content, and a brief explanation of its relevance.
-
-            2. Chain of Thought: In the "Chain of Thought" section, list out each logical step you take to derive the answer, referencing the evidence where applicable. You should perform computations if you need to to get to the answer. 
-
-            3. Answer: {self.qa_prompt}
-            ___
-            Question: {query}
-            ___
-            Context: {contexts_str}
-            
-            """
-
-            if self.llm_model == "gpt4":
-                response = self.client.chat.completions.create(
-                    model="chatgpt-4o-latest",
-                    messages=[{"role": "user", "content": prompt_template}],
-                    max_tokens=3000,
-                    temperature=0.7,
-                )
-                return response.choices[0].message.content
-
-            elif self.llm_model == "doubao":
-                # Non-streaming:
-                print("----- standard request -----")
-                completion = self.llm.chat.completions.create(
-                    model="doubao-1-5-lite-32k-250115",
-                    messages=[
-                        {"role": "user", "content": prompt_template},
-                    ],
-                )
-                return completion.choices[0].message.content
-
-            elif self.llm_model == "qwen":
-                messages = [
-                    {
-                        "role": "user",
-                        "content": [{"type": "text", "text": prompt_template}],
-                    }
-                ]
-
-                text = self.qwen_processor.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
-                inputs = self.qwen_processor(
-                    text=[text], padding=True, return_tensors="pt"
-                ).to("cuda:0")
-
-                generated_ids = self.qwen_model.generate(**inputs, max_new_tokens=512)
-                generated_ids_trimmed = [
-                    out_ids[len(in_ids) :]
-                    for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-                ]
-                output_text = self.qwen_processor.batch_decode(
-                    generated_ids_trimmed, skip_special_tokens=True
-                )
-
-                return output_text[0]
-
-        except Exception as e:
-            logger.error(f"Error generating textual response: {str(e)}")
-            return "Error generating response from textual contexts."
-
-# qa_prompts = {
-#     "feta_tab": "You are a Wikipedia editor. Answer the question with a single, well-formed, factual sentence.",
-#     "paper_tab": "You are a research scientist. Answer the question with a concise technical phrase.",
-#     "scigraphqa": "You are a scientific researcher. Answer the question in 1-2 clear, evidence-based sentences.",
-#     "slidevqa": "You are a presentation expert. Provide the exact answer to the question as it would appear on a slide. Be direct and precise.",
-#     "spiqa": "You are a scientific paper author. Answer the question in 1-3 authoritative sentences."
-# }
 
 class VisDoMRAG:
     def __init__(self, config):
@@ -1379,6 +68,7 @@ class VisDoMRAG:
         self.qa_prompt = config.get("qa_prompt", "Answer the question objectively based on the context provided.")
         self.pdf_files = config.get("pdf_files", [])
         self.dataset_csv = config.get("csv_path")
+        self.ocr_engine = config.get("ocr_engine", "dots")  # 'dots' or 'deepseek'
         if not self.dataset_csv:
             # Fallback to old behavior if csv_path not provided
             default_csv = f"{self.data_dir}/{os.path.basename(self.data_dir)}.csv"
@@ -1406,6 +96,10 @@ class VisDoMRAG:
         
         # Initialize document cache
         self.document_cache = {}
+
+        # DeepSeek-OCR handles (lazily initialized)
+        self.deepseek_model = None
+        self.deepseek_tokenizer = None
         
         # Initialize retrieval resources
         self._initialize_retrieval_resources()
@@ -1468,14 +162,22 @@ class VisDoMRAG:
         Returns:
             list: List of text from each page
         """
+        # Allow switching between DotsOCR and DeepSeek-OCR via config
+        ocr_engine = self.ocr_engine.lower() if isinstance(self.ocr_engine, str) else "dots"
+        if ocr_engine == "deepseek":
+            return self._extract_text_from_pdf_deepseek(pdf_path)
+        else:
+            return self._extract_text_from_pdf_dots(pdf_path)
+ 
+    def _extract_text_from_pdf_dots(self, pdf_path):
         try:
-            # Use DotsOCR to extract structured text from PDF
+            # Default: Use DotsOCR to extract structured text from PDF
             dots_output_dir = os.path.join(self.output_dir, "dots_ocr")
             os.makedirs(dots_output_dir, exist_ok=True)
 
             # Allow overriding DotsOCR parameters via config
             dots_kwargs = {
-                "max_completion_tokens": self.config.get("dots_max_completion_tokens", 16384),
+                "max_completion_tokens": self.config.get("dots_max_completion_tokens", 4096),  # max=16384
                 "num_thread": self.config.get("dots_num_thread", 16),
                 "dpi": self.config.get("dots_dpi", 200),
                 "output_dir": dots_output_dir,
@@ -1511,6 +213,137 @@ class VisDoMRAG:
 
         except Exception as e:
             logger.error(f"Error extracting text from {pdf_path} with DotsOCR: {str(e)}")
+            traceback.print_exc()
+            return []
+            
+    def _initialize_deepseek_ocr(self):
+        """Lazily load DeepSeek-OCR model and tokenizer for OCR-based text extraction."""
+        if self.deepseek_model is not None and self.deepseek_tokenizer is not None:
+            return
+
+        model_name = self.config.get("deepseek_ocr_model", "deepseek-ai/DeepSeek-OCR")
+        logger.info(f"Loading DeepSeek-OCR model: {model_name}")
+
+        try:
+            self.deepseek_tokenizer = AutoTokenizer.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+            )
+
+            torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+            model = AutoModel.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+                use_safetensors=True,
+                attn_implementation="eager",
+                torch_dtype=torch_dtype,
+            ).eval()
+
+            if torch.cuda.is_available():
+                model = model.to("cuda")
+
+            self.deepseek_model = model
+            logger.info("DeepSeek-OCR model loaded successfully")
+        except Exception as e:
+            logger.error(f"Error loading DeepSeek-OCR model {model_name}: {str(e)}")
+            traceback.print_exc()
+            raise
+
+    def _extract_text_from_pdf_deepseek(self, pdf_path):
+        """Extract per-page text from PDF using DeepSeek-OCR.
+
+        This mirrors the behavior of the deepseek_ocr_app backend's /api/process-pdf
+        route, but returns a simple list of markdown-like page texts in the same
+        "--- Page N ---" format used by the DotsOCR path.
+        """
+        try:
+            self._initialize_deepseek_ocr()
+        except Exception:
+            # If DeepSeek-OCR fails to initialize, fall back to DotsOCR path
+            logger.warning("Falling back to DotsOCR because DeepSeek-OCR initialization failed")
+            return self.extract_text_from_pdf(pdf_path)
+
+        try:
+            dpi = int(self.config.get("deepseek_dpi", 200))
+            base_size = int(self.config.get("deepseek_base_size", 1024))
+            image_size = int(self.config.get("deepseek_image_size", 640))
+            crop_mode = bool(self.config.get("deepseek_crop_mode", True))
+
+            # Convert PDF pages to images (reuse existing pdf2image dependency)
+            logger.info(f"Using DeepSeek-OCR to extract text from PDF: {pdf_path} (dpi={dpi})")
+            pages_img = convert_from_path(pdf_path, dpi=dpi)
+            total_pages = len(pages_img)
+            if total_pages == 0:
+                logger.warning(f"No pages found when converting PDF {pdf_path} to images")
+                return []
+
+            pages = []
+            # Simple prompt: same as 'plain_ocr' mode in deepseek backend
+            prompt_text = "<image>\nFree OCR."
+
+            for page_idx, img in enumerate(pages_img):
+                tmp_img = None
+                out_dir = None
+                try:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+                        img.save(tmp, format="PNG")
+                        tmp_img = tmp.name
+
+                    out_dir = tempfile.mkdtemp(prefix="dsocr_pdf_")
+
+                    # Run inference
+                    res = self.deepseek_model.infer(
+                        self.deepseek_tokenizer,
+                        prompt=prompt_text,
+                        image_file=tmp_img,
+                        output_path=out_dir,
+                        base_size=base_size,
+                        image_size=image_size,
+                        crop_mode=crop_mode,
+                        save_results=False,
+                        test_compress=False,
+                        eval_mode=True,
+                    )
+
+                    # Normalize response
+                    if isinstance(res, str):
+                        text = res.strip()
+                    elif isinstance(res, dict) and "text" in res:
+                        text = str(res["text"]).strip()
+                    elif isinstance(res, (list, tuple)):
+                        text = "\n".join(map(str, res)).strip()
+                    else:
+                        text = ""
+
+                    if not text:
+                        mmd = os.path.join(out_dir, "result.mmd")
+                        if os.path.exists(mmd):
+                            with open(mmd, "r", encoding="utf-8") as fh:
+                                text = fh.read().strip()
+                    if not text:
+                        text = f"No text returned for page {page_idx + 1}."
+
+                    page_no = page_idx + 1
+                    pages.append(f"--- Page {page_no} ---\n{text}\n")
+
+                except Exception as e:
+                    logger.error(
+                        f"Error extracting text from PDF {pdf_path} page {page_idx + 1} with DeepSeek-OCR: {str(e)}"
+                    )
+                    traceback.print_exc()
+                    continue
+                finally:
+                    if tmp_img:
+                        try:
+                            os.remove(tmp_img)
+                        except Exception:
+                            pass
+                    if out_dir:
+                        shutil.rmtree(out_dir, ignore_errors=True)
+
+            return pages
+        except Exception as e:
+            logger.error(f"Error extracting text from {pdf_path} with DeepSeek-OCR: {str(e)}")
             traceback.print_exc()
             return []
     
@@ -1618,28 +451,6 @@ class VisDoMRAG:
             logger.error(f"Error caching documents: {str(e)}")
             traceback.print_exc()
             return {}
-    
-    def identify_document_and_page(self, chunk):
-        """
-        Identify which document and page a chunk belongs to.
-        
-        Args:
-            chunk (str): Text chunk
-            
-        Returns:
-            tuple: (arxiv_id, page_num)
-        """
-        max_ratio = 0
-        best_match = (None, None)
-        
-        for arxiv_id, pages in self.document_cache.items():
-            for page_num, page_text in enumerate(pages):
-                ratio = SequenceMatcher(None, chunk, page_text).ratio()
-                if ratio > max_ratio:
-                    max_ratio = ratio
-                    best_match = (arxiv_id, page_num)
-        
-        return best_match
     
     def build_visual_index(self):
         """Proxy to the visual RAG engine for building the visual index."""
@@ -1784,13 +595,28 @@ class VisDoMRAG:
                 return self.parse_combined_output(response.choices[0].message.content)
                 
             elif self.llm_model == "doubao":
-                combined_response = self.llm.chat.completions.create(
-                    model="doubao-1-5-lite-32k-250115",
-                    messages=[
-                         {"role": "user", "content": prompt},
+                # combined_response = self.llm.chat.completions.create(
+                #     model="doubao-1-5-lite-32k-250115",
+                #     messages=[
+                #          {"role": "user", "content": prompt},
+                #     ],
+                # )
+                # return self.parse_combined_output(combined_response.choices[0].message.content)
+                combined_response = self.llm.responses.create(
+                    model="doubao-seed-1-6-flash-250828",
+                    input=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": prompt,
+                                }
+                            ],
+                        }
                     ],
                 )
-                return self.parse_combined_output(combined_response.choices[0].message.content)
+                return self.parse_combined_output(combined_response.output[1].content[0].text)
                 
             elif self.llm_model == "qwen":
                 messages = [
@@ -1842,44 +668,103 @@ class VisDoMRAG:
     def answer_question(self, question):
         try:
             start_time = time.time()
-
-            logger.info("Step 1/5: Retrieving visual contexts...")
-            step_start = time.time()
-            visual_contexts = self.retrieve_visual_contexts_for_question(question)
-            logger.info("Step 1/5 completed in %.2f seconds", time.time() - step_start)
             visual_response_dict = None
-            if visual_contexts:
-                logger.info("Step 2/5: Generating visual response...")
-                step_start = time.time()
-                visual_response = self.generate_visual_response(question, visual_contexts)
-                logger.info("Step 2/5 completed in %.2f seconds", time.time() - step_start)
-                visual_response_dict = self.extract_sections(visual_response)
-                visual_response_dict.update(
-                    {
-                        "question": question,
-                        "document": [ctx["document_id"] for ctx in visual_contexts],
-                        "pages": [ctx["page_number"] for ctx in visual_contexts],
-                    }
-                )
-            logger.info("Step 3/5: Retrieving textual contexts...")
-            step_start = time.time()
-            textual_contexts = self.retrieve_textual_contexts_for_question(question)
-            logger.info("Step 3/5 completed in %.2f seconds", time.time() - step_start)
             textual_response_dict = None
-            if textual_contexts:
-                logger.info("Step 4/5: Generating textual response...")
+
+            def _run_visual_branch():
+                logger.info("Step 1/5: Retrieving visual contexts...")
                 step_start = time.time()
-                textual_response = self.generate_textual_response(question, textual_contexts)
-                logger.info("Step 4/5 completed in %.2f seconds", time.time() - step_start)
-                textual_response_dict = self.extract_sections(textual_response)
-                textual_response_dict.update(
+                visual_contexts_local = self.retrieve_visual_contexts_for_question(question)
+                logger.info(
+                    "Step 1/5 completed in %.2f seconds", time.time() - step_start
+                )
+                if not visual_contexts_local:
+                    return None
+                logger.info("Step 2/5: Generating visual response...")
+                step_start_inner = time.time()
+                visual_response = self.generate_visual_response(
+                    question, visual_contexts_local
+                )
+                logger.info(
+                    "Step 2/5 completed in %.2f seconds",
+                    time.time() - step_start_inner,
+                )
+                vr_dict = self.extract_sections(visual_response)
+                vr_dict.update(
                     {
                         "question": question,
-                        "document": [ctx["chunk_pdf_name"] for ctx in textual_contexts],
-                        "pages": [ctx["pdf_page_number"] for ctx in textual_contexts],
-                        "chunks": "\n".join([ctx["chunk"] for ctx in textual_contexts]),
+                        "document": [ctx["document_id"] for ctx in visual_contexts_local],
+                        "pages": [ctx["page_number"] for ctx in visual_contexts_local],
                     }
                 )
+                return vr_dict
+
+            def _run_textual_branch():
+                logger.info("Step 3/5: Retrieving textual contexts...")
+                step_start = time.time()
+                textual_contexts_local = self.retrieve_textual_contexts_for_question(
+                    question
+                )
+                logger.info(
+                    "Step 3/5 completed in %.2f seconds", time.time() - step_start
+                )
+                if not textual_contexts_local:
+                    return None
+                for i, ctx in enumerate(textual_contexts_local):
+                    chunk = ctx.get("chunk", "")
+                    doc_id = ctx.get("chunk_pdf_name")
+                    page_num = ctx.get("pdf_page_number")
+                    preview = chunk[:60].replace("\n", " ") + ("..." if len(chunk) > 60 else "")
+                    print(f"  - #{i}: doc={doc_id}, page={page_num}, text_preview={preview}")
+                logger.info("Step 4/5: Generating textual response...")
+                step_start_inner = time.time()
+                textual_response = self.generate_textual_response(
+                    question, textual_contexts_local
+                )
+                logger.info(
+                    "Step 4/5 completed in %.2f seconds",
+                    time.time() - step_start_inner,
+                )
+                tr_dict = self.extract_sections(textual_response)
+                tr_dict.update(
+                    {
+                        "question": question,
+                        "document": [
+                            ctx["chunk_pdf_name"] for ctx in textual_contexts_local
+                        ],
+                        "pages": [
+                            ctx["pdf_page_number"] for ctx in textual_contexts_local
+                        ],
+                        "chunks": "\n".join(
+                            [ctx["chunk"] for ctx in textual_contexts_local]
+                        ),
+                    }
+                )
+                return tr_dict
+
+            # Run visual and textual branches in parallel
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                future_to_kind = {
+                    executor.submit(_run_visual_branch): "visual",
+                    executor.submit(_run_textual_branch): "textual",
+                }
+                for future in as_completed(future_to_kind):
+                    kind = future_to_kind[future]
+                    try:
+                        result = future.result()
+                    except Exception as e:
+                        logger.error(
+                            "Error in %s branch while answering question: %s",
+                            kind,
+                            str(e),
+                        )
+                        traceback.print_exc()
+                        continue
+                    if kind == "visual":
+                        visual_response_dict = result
+                    else:
+                        textual_response_dict = result
+
             if visual_response_dict and textual_response_dict:
                 logger.info("Step 5/5: Combining responses...")
                 step_start = time.time()
@@ -1887,9 +772,11 @@ class VisDoMRAG:
                     question,
                     visual_response_dict,
                     textual_response_dict,
-                    None
+                    None,
                 )
-                logger.info("Step 5/5 completed in %.2f seconds", time.time() - step_start)
+                logger.info(
+                    "Step 5/5 completed in %.2f seconds", time.time() - step_start
+                )
                 combined_response = {
                     "question": question,
                     "answer": combined_sections.get("Final Answer", ""),
@@ -1898,10 +785,15 @@ class VisDoMRAG:
                     "response1": visual_response_dict,
                     "response2": textual_response_dict,
                 }
-                logger.info("answer_question completed in %.2f seconds", time.time() - start_time)
+                logger.info(
+                    "answer_question completed in %.2f seconds", time.time() - start_time
+                )
                 return combined_response
             if visual_response_dict:
-                logger.info("answer_question completed in %.2f seconds (visual only)", time.time() - start_time)
+                logger.info(
+                    "answer_question completed in %.2f seconds (visual only)",
+                    time.time() - start_time,
+                )
                 return {
                     "question": question,
                     "answer": visual_response_dict.get("Answer", ""),
@@ -1911,7 +803,10 @@ class VisDoMRAG:
                     "response2": textual_response_dict,
                 }
             if textual_response_dict:
-                logger.info("answer_question completed in %.2f seconds (textual only)", time.time() - start_time)
+                logger.info(
+                    "answer_question completed in %.2f seconds (textual only)",
+                    time.time() - start_time,
+                )
                 return {
                     "question": question,
                     "answer": textual_response_dict.get("Answer", ""),
