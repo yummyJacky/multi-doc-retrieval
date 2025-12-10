@@ -27,6 +27,8 @@ import tempfile
 import shutil
 from visual_rag import VisualRAGEngine 
 from textual_rag import TextualRAGEngine 
+from ocr_extractor import OCRExtractor
+from qwenvl_caption import QwenVLCaptioner
 
 # For embeddings and retrieval
 try:
@@ -96,13 +98,14 @@ class VisDoMRAG:
         
         # Initialize document cache
         self.document_cache = {}
-
-        # DeepSeek-OCR handles (lazily initialized)
-        self.deepseek_model = None
-        self.deepseek_tokenizer = None
         
-        # Initialize retrieval resources
-        self._initialize_retrieval_resources()
+        # Helper modules for OCR extraction and Qwen-VL image captioning
+        self.ocr_extractor = OCRExtractor(self.config, self.output_dir, logger)
+        self.qwen_captioner = QwenVLCaptioner(self.config.get("qwen_vl_checkpoint"), logger)
+        
+        # Retrieval engines (lazy init when first used)
+        self.visual_engine = None
+        self.textual_engine = None
         
     def _initialize_llm(self):
         """Initialize the LLM based on the selected model."""
@@ -146,179 +149,14 @@ class VisDoMRAG:
         else:
             raise ValueError(f"Unsupported LLM model: {self.llm_model}")
 
-    def _init_qwen_vl_captioner(self):
-        """Lazily initialize Qwen-VL via vLLM for image captioning, using a checkpoint from config."""
-        if hasattr(self, "qwen_vl_llm") and self.qwen_vl_llm is not None:
-            return
-
-        checkpoint_path = self.config.get("qwen_vl_checkpoint")
-        if not checkpoint_path:
-            logger.warning("qwen_vl_checkpoint not set in config; image captions will be skipped.")
-            self.qwen_vl_llm = None
-            return
-
-        try:
-            from transformers import AutoProcessor
-            from qwen_vl_utils import process_vision_info as qwen_vl_process_vision_info
-            from vllm import LLM, SamplingParams
-
-            self.qwen_vl_processor = AutoProcessor.from_pretrained(checkpoint_path)
-            self.qwen_vl_process_vision_info = qwen_vl_process_vision_info
-
-            self.qwen_vl_llm = LLM(
-                model=checkpoint_path,
-                trust_remote_code=True,
-                gpu_memory_utilization=0.5,
-                enforce_eager=False,
-                seed=0,
-                max_model_len=32768,
-            )
-
-            self.qwen_vl_sampling_params = SamplingParams(
-                temperature=0,
-                max_tokens=256,
-                top_k=-1,
-                stop_token_ids=[],
-            )
-            logger.info(f"Initialized Qwen-VL captioner from checkpoint: {checkpoint_path}")
-        except ImportError as e:
-            logger.error(f"Failed to import dependencies for Qwen-VL captioner: {str(e)}")
-            self.qwen_vl_llm = None
-        except Exception as e:
-            logger.error(f"Error initializing Qwen-VL captioner: {str(e)}")
-            self.qwen_vl_llm = None
-
-    def _prepare_inputs_for_qwen_vl(self, messages):
-        """Prepare multimodal inputs for vLLM based Qwen-VL, following test_qwenvl.ipynb."""
-        processor = getattr(self, "qwen_vl_processor", None)
-        process_vision = getattr(self, "qwen_vl_process_vision_info", None)
-        if processor is None or process_vision is None:
-            return None
-
-        text = processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-
-        image_inputs, video_inputs, video_kwargs = process_vision(
-            messages,
-            image_patch_size=processor.image_processor.patch_size,
-            return_video_kwargs=True,
-            return_video_metadata=True,
-        )
-
-        mm_data = {}
-        if image_inputs is not None:
-            mm_data["image"] = image_inputs
-        if video_inputs is not None:
-            mm_data["video"] = video_inputs
-
-        return {
-            "prompt": text,
-            "multi_modal_data": mm_data,
-            "mm_processor_kwargs": video_kwargs,
-        }
-
-    def _caption_image_with_qwen_vl(self, image_path: str) -> str:
-        """Use Qwen-VL via vLLM to generate a caption for a single image file path.
-
-        The prompt follows test_qwenvl.ipynb: if the image contains text or tables,
-        produce a brief description of key information; otherwise return an empty caption.
-        """
-        self._init_qwen_vl_captioner()
-        if getattr(self, "qwen_vl_llm", None) is None:
-            return ""
-
-        if not os.path.exists(image_path):
-            logger.warning(f"Image file for captioning not found: {image_path}")
-            return ""
-
-        prompt = "图片如果包含任何文本或表格数据，生成简短的描述，概述其关键信息；如果没有，请返回 '无描述'。"
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": image_path},
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        ]
-
-        inputs = self._prepare_inputs_for_qwen_vl(messages)
-        if inputs is None:
-            return ""
-
-        try:
-            llm = self.qwen_vl_llm
-            sampling_params = self.qwen_vl_sampling_params
-            outputs = llm.generate([inputs], sampling_params=sampling_params)
-            if not outputs:
-                return ""
-            generated = outputs[0].outputs[0].text if outputs[0].outputs else ""
-            caption = (generated or "").strip().strip("'\"")
-            if caption == "无描述":
-                return ""
-            return caption
-        except Exception as e:
-            logger.error(f"Error generating caption with Qwen-VL for {image_path}: {str(e)}")
-            return ""
-
-    def _augment_md_with_image_captions(self, md_path: str) -> str:
-        """Scan a markdown file for images and append Qwen-VL captions with a `caption` marker.
-
-        For each pattern like `![](relative_image_path.png)`, this will:
-        - Resolve the image path relative to the markdown file location.
-        - Call Qwen-VL captioner on the image.
-        - If a non-empty caption is returned, rewrite the markdown as
-          `![](relative_image_path.png) caption: <caption>`.
-
-        The modified markdown is written back to `md_path`, and the final text is returned.
-        """
-        try:
-            with open(md_path, "r", encoding="utf-8") as f:
-                md_text = f.read()
-        except Exception as e:
-            logger.error(f"Error reading markdown for caption augmentation {md_path}: {str(e)}")
-            return ""
-
-        # Match markdown image syntax: ![](relative_path)
-        pattern = r"!\[]\(([^)]+)\)"
-        dir_name = os.path.dirname(md_path)
-
-        def _replace(match):
-            rel_path = match.group(1)
-            full_path = os.path.join(dir_name, rel_path)
-            if not os.path.exists(full_path):
-                return match.group(0)
-
-            caption = self._caption_image_with_qwen_vl(full_path)
-            if not caption:
-                return match.group(0)
-
-            # Append caption marker after the image reference
-            return f"{match.group(0)} caption: {caption}"
-
-        try:
-            new_md_text = re.sub(pattern, _replace, md_text)
-        except Exception as e:
-            logger.error(f"Error applying caption regex to markdown {md_path}: {str(e)}")
-            return md_text
-
-        if new_md_text != md_text:
-            try:
-                with open(md_path, "w", encoding="utf-8") as f:
-                    f.write(new_md_text)
-            except Exception as e:
-                logger.error(f"Error writing augmented markdown to {md_path}: {str(e)}")
-                # Even if write fails, return the in-memory version
-        return new_md_text
-    
-    def _initialize_retrieval_resources(self):
-        """Initialize resources needed for retrieval."""
-        # Create dedicated engines for visual and textual RAG
-        self.visual_engine = VisualRAGEngine(self)
-        self.textual_engine = TextualRAGEngine(self)
+    def _initialize_visual_retrieval_resources(self):
+        """Lazily initialize resources needed for retrieval (visual & textual)."""
+        if self.visual_engine is None:
+            self.visual_engine = VisualRAGEngine(self)
+            
+    def _initialize_textual_retrieval_resources(self):
+        if self.textual_engine is None:
+            self.textual_engine = TextualRAGEngine(self)
 
     def extract_text_from_pdf(self, pdf_path):
         """
@@ -332,189 +170,18 @@ class VisDoMRAG:
         """
         # Allow switching between DotsOCR and DeepSeek-OCR via config
         ocr_engine = self.ocr_engine.lower() if isinstance(self.ocr_engine, str) else "dots"
-        if ocr_engine == "deepseek":
-            return self._extract_text_from_pdf_deepseek(pdf_path)
-        else:
-            return self._extract_text_from_pdf_dots(pdf_path)
- 
-    def _extract_text_from_pdf_dots(self, pdf_path):
-        try:
-            # Default: Use DotsOCR to extract structured text from PDF
-            dots_output_dir = os.path.join(self.output_dir, "dots_ocr")
-            os.makedirs(dots_output_dir, exist_ok=True)
 
-            # Allow overriding DotsOCR parameters via config
-            dots_kwargs = {
-                "max_completion_tokens": self.config.get("dots_max_completion_tokens", 4096),  # max=16384
-                "num_thread": self.config.get("dots_num_thread", 16),
-                "dpi": self.config.get("dots_dpi", 200),
-                "output_dir": dots_output_dir,
-            }
+        # Use external OCRExtractor and (optionally) Qwen-VL captioner to
+        # perform OCR and image caption augmentation on the markdown.
+        captioner = None
+        if self.config.get("qwen_vl_checkpoint"):
+            captioner = self.qwen_captioner
 
-            logger.info(f"Using DotsOCR to extract text from PDF: {pdf_path}")
-            dots_ocr_parser = DotsOCRParser(**dots_kwargs)
-
-            prompt_mode = self.config.get("dots_prompt_mode", "prompt_layout_all_en")
-            results = dots_ocr_parser.parse_file(
-                pdf_path,
-                output_dir=dots_output_dir,
-                prompt_mode=prompt_mode,
-            )
-
-            pages = []
-            # Results are per page with 'page_no' and md_content_path/md_content_nohf_path
-            for res in sorted(results, key=lambda r: r.get("page_no", 0)):
-                md_path = res.get("md_content_path") or res.get("md_content_nohf_path")
-                page_no = res.get("page_no", len(pages)) + 1
-                page_text = ""
-                if md_path and os.path.exists(md_path):
-                    try:
-                        # Augment markdown with image captions (if Qwen-VL is configured),
-                        # and use the final text for caching.
-                        page_text = self._augment_md_with_image_captions(md_path) or ""
-                    except Exception as read_err:
-                        logger.error(
-                            f"Error reading DotsOCR markdown for {pdf_path} page {page_no}: {read_err}"
-                        )
-                pages.append(f"--- Page {page_no} ---\n{page_text}\n")
-
-            return pages
-
-        except Exception as e:
-            logger.error(f"Error extracting text from {pdf_path} with DotsOCR: {str(e)}")
-            traceback.print_exc()
-            return []
-            
-    def _initialize_deepseek_ocr(self):
-        """Lazily load DeepSeek-OCR model and tokenizer for OCR-based text extraction."""
-        if self.deepseek_model is not None and self.deepseek_tokenizer is not None:
-            return
-
-        model_name = self.config.get("deepseek_ocr_model", "deepseek-ai/DeepSeek-OCR")
-        logger.info(f"Loading DeepSeek-OCR model: {model_name}")
-
-        try:
-            self.deepseek_tokenizer = AutoTokenizer.from_pretrained(
-                model_name,
-                trust_remote_code=True,
-            )
-
-            torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-            model = AutoModel.from_pretrained(
-                model_name,
-                trust_remote_code=True,
-                use_safetensors=True,
-                attn_implementation="eager",
-                torch_dtype=torch_dtype,
-            ).eval()
-
-            if torch.cuda.is_available():
-                model = model.to("cuda")
-
-            self.deepseek_model = model
-            logger.info("DeepSeek-OCR model loaded successfully")
-        except Exception as e:
-            logger.error(f"Error loading DeepSeek-OCR model {model_name}: {str(e)}")
-            traceback.print_exc()
-            raise
-
-    def _extract_text_from_pdf_deepseek(self, pdf_path):
-        """Extract per-page text from PDF using DeepSeek-OCR.
-
-        This mirrors the behavior of the deepseek_ocr_app backend's /api/process-pdf
-        route, but returns a simple list of markdown-like page texts in the same
-        "--- Page N ---" format used by the DotsOCR path.
-        """
-        try:
-            self._initialize_deepseek_ocr()
-        except Exception:
-            # If DeepSeek-OCR fails to initialize, fall back to DotsOCR path
-            logger.warning("Falling back to DotsOCR because DeepSeek-OCR initialization failed")
-            return self._extract_text_from_pdf_dots(pdf_path)
-
-        try:
-            dpi = int(self.config.get("deepseek_dpi", 200))
-            base_size = int(self.config.get("deepseek_base_size", 1024))
-            image_size = int(self.config.get("deepseek_image_size", 640))
-            crop_mode = bool(self.config.get("deepseek_crop_mode", True))
-
-            # Convert PDF pages to images (reuse existing pdf2image dependency)
-            logger.info(f"Using DeepSeek-OCR to extract text from PDF: {pdf_path} (dpi={dpi})")
-            pages_img = convert_from_path(pdf_path, dpi=dpi)
-            total_pages = len(pages_img)
-            if total_pages == 0:
-                logger.warning(f"No pages found when converting PDF {pdf_path} to images")
-                return []
-
-            pages = []
-            # Simple prompt: same as 'plain_ocr' mode in deepseek backend
-            prompt_text = "<image>\nFree OCR."
-
-            for page_idx, img in enumerate(pages_img):
-                tmp_img = None
-                out_dir = None
-                try:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-                        img.save(tmp, format="PNG")
-                        tmp_img = tmp.name
-
-                    out_dir = tempfile.mkdtemp(prefix="dsocr_pdf_")
-
-                    # Run inference
-                    res = self.deepseek_model.infer(
-                        self.deepseek_tokenizer,
-                        prompt=prompt_text,
-                        image_file=tmp_img,
-                        output_path=out_dir,
-                        base_size=base_size,
-                        image_size=image_size,
-                        crop_mode=crop_mode,
-                        save_results=False,
-                        test_compress=False,
-                        eval_mode=True,
-                    )
-
-                    # Normalize response
-                    if isinstance(res, str):
-                        text = res.strip()
-                    elif isinstance(res, dict) and "text" in res:
-                        text = str(res["text"]).strip()
-                    elif isinstance(res, (list, tuple)):
-                        text = "\n".join(map(str, res)).strip()
-                    else:
-                        text = ""
-
-                    if not text:
-                        mmd = os.path.join(out_dir, "result.mmd")
-                        if os.path.exists(mmd):
-                            with open(mmd, "r", encoding="utf-8") as fh:
-                                text = fh.read().strip()
-                    if not text:
-                        text = f"No text returned for page {page_idx + 1}."
-
-                    page_no = page_idx + 1
-                    pages.append(f"--- Page {page_no} ---\n{text}\n")
-
-                except Exception as e:
-                    logger.error(
-                        f"Error extracting text from PDF {pdf_path} page {page_idx + 1} with DeepSeek-OCR: {str(e)}"
-                    )
-                    traceback.print_exc()
-                    continue
-                finally:
-                    if tmp_img:
-                        try:
-                            os.remove(tmp_img)
-                        except Exception:
-                            pass
-                    if out_dir:
-                        shutil.rmtree(out_dir, ignore_errors=True)
-
-            return pages
-        except Exception as e:
-            logger.error(f"Error extracting text from {pdf_path} with DeepSeek-OCR: {str(e)}")
-            traceback.print_exc()
-            return []
+        return self.ocr_extractor.extract_text_from_pdf(
+            pdf_path,
+            ocr_engine=ocr_engine,
+            captioner=captioner,
+        )
     
     def split_text(self, text):
         """
@@ -623,10 +290,12 @@ class VisDoMRAG:
     
     def build_visual_index(self):
         """Proxy to the visual RAG engine for building the visual index."""
+        self._initialize_visual_retrieval_resources()
         return self.visual_engine.build_visual_index()
 
     def build_text_index(self):
         """Proxy to the textual RAG engine for building the text index."""
+        self._initialize_textual_retrieval_resources()
         return self.textual_engine.build_text_index()
 
     def retrieve_visual_contexts(self, query_id):

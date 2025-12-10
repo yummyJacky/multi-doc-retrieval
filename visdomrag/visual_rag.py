@@ -49,9 +49,20 @@ class VisualRAGEngine:
             f"{self.data_dir}/retrieval/retrieval_{self.vision_retriever}.csv"
         )
 
-        # Model / processor handles
+        # Model / processor handles (lazy-loaded on first use)
         self.vision_model = None
         self.vision_processor = None
+
+        # Interactive visual index state
+        self._visual_index_built = False
+        self._page_embeddings = None  # Tensor of shape [n_pages, n_tokens, dim]
+        self._page_ids = []
+        self._page_info = {}
+
+    def _ensure_vision_model(self):
+        """Lazily load visual retrieval model/processor based on vision_retriever."""
+        if self.vision_model is not None:
+            return
 
         # Keep original ColPali / ColQwen flows, and add Nemo as an alternative
         if self.vision_retriever in ["colpali", "colqwen"]:
@@ -107,17 +118,13 @@ class VisualRAGEngine:
         else:
             raise ValueError(f"Unsupported visual retriever: {self.vision_retriever}")
 
-        # Interactive visual index state
-        self._visual_index_built = False
-        self._page_embeddings = None  # Tensor of shape [n_pages, n_tokens, dim]
-        self._page_ids = []
-        self._page_info = {}
-
     def build_visual_index(self):
         """Build visual embedding index for all PDFs in the dataset using multi-vector scoring."""
         logger.info(f"Building visual index using {self.vision_retriever}")
 
         try:
+            # Ensure visual model is ready
+            self._ensure_vision_model()
             pdf_dir = os.path.join(self.data_dir, "docs")
             output_dir = os.path.join(self.data_dir, "visual_embeddings")
             os.makedirs(output_dir, exist_ok=True)
@@ -536,6 +543,8 @@ class VisualRAGEngine:
             return []
 
     def _build_interactive_visual_index(self):
+        # Ensure visual model is ready for interactive index as well
+        self._ensure_vision_model()
         if self._visual_index_built:
             return
         if not self.pdf_files:
