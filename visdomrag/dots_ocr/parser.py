@@ -223,8 +223,10 @@ class DotsOCRParser:
                     'layout_image_path': image_layout_path,
                 })
                 if prompt_mode != "prompt_layout_only_en":  # no text md when detection only
-                    md_content = layoutjson2md(origin_image, cells, text_key='text')
-                    md_content_no_hf = layoutjson2md(origin_image, cells, text_key='text', no_page_hf=True) # used for clean output or metric of omnidocbench、olmbench 
+                    # Save cropped images to disk instead of embedding base64 in Markdown.
+                    # Images will be stored in save_dir and referenced via relative paths.
+                    md_content = layoutjson2md(origin_image, cells, text_key='text', save_dir=save_dir, image_prefix=save_name)
+                    md_content_no_hf = layoutjson2md(origin_image, cells, text_key='text', no_page_hf=True, save_dir=save_dir, image_prefix=save_name) # used for clean output or metric of omnidocbench、olmbench 
                     md_file_path = os.path.join(save_dir, f"{save_name}.md")
                     with open(md_file_path, "w", encoding="utf-8") as md_file:
                         md_file.write(md_content)

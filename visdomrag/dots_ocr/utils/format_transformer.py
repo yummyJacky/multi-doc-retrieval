@@ -142,7 +142,7 @@ def clean_text(text: str) -> str:
     return text
 
 
-def layoutjson2md(image: Image.Image, cells: list, text_key: str = 'text', no_page_hf: bool = False) -> str:
+def layoutjson2md(image: Image.Image, cells: list, text_key: str = 'text', no_page_hf: bool = False, save_dir: str = None, image_prefix: str = None) -> str:
     """
     Converts a layout JSON format to Markdown.
     
@@ -168,8 +168,26 @@ def layoutjson2md(image: Image.Image, cells: list, text_key: str = 'text', no_pa
         
         if cell['category'] == 'Picture':
             image_crop = image.crop((x1, y1, x2, y2))
-            image_base64 = PILimage_to_base64(image_crop)
-            text_items.append(f"![]({image_base64})")
+
+            # If a save directory is provided, save the cropped image as a file
+            # and reference it via a relative path in Markdown. Otherwise,
+            # fall back to the original base64 embedding behavior.
+            if save_dir is not None:
+                # Use a deterministic file name per image
+                prefix = image_prefix or "image"
+                image_filename = f"{prefix}_img_{i}.png"
+                image_path = os.path.join(save_dir, image_filename)
+
+                # Ensure directory exists and save image
+                os.makedirs(save_dir, exist_ok=True)
+                image_crop.save(image_path, format="PNG")
+
+                # Since the Markdown file is saved in the same save_dir,
+                # we only need the file name as a relative path.
+                text_items.append(f"![]({image_filename})")
+            else:
+                image_base64 = PILimage_to_base64(image_crop)
+                text_items.append(f"![]({image_base64})")
         elif cell['category'] == 'Formula':
             text_items.append(get_formula_in_markdown(text))
         else:            
