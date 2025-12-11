@@ -9,7 +9,7 @@ from pdf2image import convert_from_path
 from transformers import AutoModel, AutoTokenizer
 
 from dots_ocr.parser import DotsOCRParser
-
+from tqdm.auto import tqdm
 
 class OCRExtractor:
     """Helper for extracting per-page text from PDFs using OCR engines.
@@ -69,7 +69,7 @@ class OCRExtractor:
             )
 
             pages: List[str] = []
-            for res in sorted(results, key=lambda r: r.get("page_no", 0)):
+            for res in tqdm(sorted(results, key=lambda r: r.get("page_no", 0)),desc="Generating the descriptive text for image..."):
                 md_path = res.get("md_content_path") or res.get("md_content_nohf_path")
                 page_no = res.get("page_no", len(pages)) + 1
                 page_text = ""

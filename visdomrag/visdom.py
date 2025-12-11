@@ -11,17 +11,10 @@ import re
 import uuid
 import csv
 from tqdm import tqdm
-from io import BytesIO
-from pdf2image import convert_from_path
-import base64
-import requests
 from PIL import Image
 import gc
-from difflib import SequenceMatcher
 import traceback
 from openai import OpenAI
-from dots_ocr.parser import DotsOCRParser
-from transformers import AutoModel, AutoTokenizer
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import tempfile
 import shutil
@@ -29,15 +22,6 @@ from visual_rag import VisualRAGEngine
 from textual_rag import TextualRAGEngine 
 from ocr_extractor import OCRExtractor
 from qwenvl_caption import QwenVLCaptioner
-
-# For embeddings and retrieval
-try:
-    import chromadb
-    import chromadb.utils.embedding_functions as embedding_functions
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
-    from rank_bm25 import BM25Okapi
-except ImportError as e:
-    print(f"Optional dependency missing: {e}")
 
 # Configure logging
 logging.basicConfig(
@@ -101,7 +85,12 @@ class VisDoMRAG:
         
         # Helper modules for OCR extraction and Qwen-VL image captioning
         self.ocr_extractor = OCRExtractor(self.config, self.output_dir, logger)
-        self.qwen_captioner = QwenVLCaptioner(self.config.get("qwen_vl_checkpoint"), logger)
+        self.qwen_captioner = QwenVLCaptioner(
+            self.config.get("qwen_vl_server_url"),
+            self.config.get("qwen_vl_model", "Qwen/Qwen3-VL-4B-Instruct"),
+            logger,
+            self.config.get("qwen_vl_api_key"),
+        )
         
         # Retrieval engines (lazy init when first used)
         self.visual_engine = None
@@ -173,8 +162,10 @@ class VisDoMRAG:
 
         # Use external OCRExtractor and (optionally) Qwen-VL captioner to
         # perform OCR and image caption augmentation on the markdown.
+        # Qwen-VL is now provided as an external vLLM HTTP service, configured
+        # via qwen_vl_server_url. If not set, we skip captioning gracefully.
         captioner = None
-        if self.config.get("qwen_vl_checkpoint"):
+        if self.config.get("qwen_vl_server_url"):
             captioner = self.qwen_captioner
 
         return self.ocr_extractor.extract_text_from_pdf(
@@ -182,22 +173,6 @@ class VisDoMRAG:
             ocr_engine=ocr_engine,
             captioner=captioner,
         )
-    
-    def split_text(self, text):
-        """
-        Split text into chunks.
-        
-        Args:
-            text (str): Text to split
-            
-        Returns:
-            list: List of text chunks
-        """
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=self.chunk_size,
-            chunk_overlap=self.chunk_overlap,
-        )
-        return text_splitter.split_text(text)
     
     def _get_config_pdf_paths(self):
         paths = {}

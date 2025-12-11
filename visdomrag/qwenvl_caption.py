@@ -1,100 +1,63 @@
+import base64
+import json
+import logging
 import os
 import re
-import logging
 from typing import Optional, Dict, Any
+
+import requests
 
 
 class QwenVLCaptioner:
-    """Helper for generating image captions using a Qwen-VL model served via vLLM.
+    """Helper for generating image captions using a Qwen-VL model via a vLLM HTTP server.
 
-    The model checkpoint path should be provided via `checkpoint_path`.
-    Captioning is performed lazily: the underlying model is only initialized
-    when the first caption request is made.
+    Instead of loading the model locally, this class talks to an external vLLM
+    server that exposes an OpenAI-compatible `/v1/chat/completions` endpoint.
+
+    Typical config (in VisDoMRAG):
+      - qwen_vl_server_url: base URL of the vLLM server, e.g. "http://127.0.0.1:8000" or "http://127.0.0.1:8000/v1"
+      - qwen_vl_model: model name served by vLLM, e.g. "Qwen/Qwen3-VL-4B-Instruct"
+      - qwen_vl_api_key: optional API key used by the vLLM OpenAI server
     """
 
-    def __init__(self, checkpoint_path: Optional[str], logger: logging.Logger) -> None:
-        self.checkpoint_path = checkpoint_path
+    def __init__(
+        self,
+        server_url: Optional[str],
+        model_name: str,
+        logger: logging.Logger,
+        api_key: Optional[str] = None,
+        timeout: float = 60.0,
+    ) -> None:
+        self.server_url = server_url.rstrip("/") if server_url else None
+        self.model_name = model_name
         self.logger = logger
+        self.api_key = api_key or os.getenv("QWEN_VL_API_KEY")
+        self.timeout = timeout
 
-        self._processor = None
-        self._process_vision_info = None
-        self._llm = None
-        self._sampling_params = None
+        # Internal flag to avoid repeating warnings when server URL is missing.
+        self._unavailable_warned = False
 
-    def _ensure_initialized(self) -> None:
-        """Lazily initialize processor, vision helper and vLLM engine."""
-        if self._llm is not None:
-            return
-
-        if not self.checkpoint_path:
-            self.logger.warning(
-                "qwen_vl_checkpoint not set in config; image captions will be skipped."
-            )
-            return
-
-        try:
-            from transformers import AutoProcessor
-            from qwen_vl_utils import process_vision_info as qwen_vl_process_vision_info
-            from vllm import LLM, SamplingParams
-
-            self._processor = AutoProcessor.from_pretrained(self.checkpoint_path)
-            self._process_vision_info = qwen_vl_process_vision_info
-
-            self._llm = LLM(
-                model=self.checkpoint_path,
-                trust_remote_code=True,
-                gpu_memory_utilization=0.5,
-                enforce_eager=False,
-                seed=0,
-                max_model_len=32768,
-            )
-
-            self._sampling_params = SamplingParams(
-                temperature=0,
-                max_tokens=256,
-                top_k=-1,
-                stop_token_ids=[],
-            )
-            self.logger.info(
-                "Initialized Qwen-VL captioner from checkpoint: %s",
-                self.checkpoint_path,
-            )
-        except ImportError as e:
-            self.logger.error(
-                "Failed to import dependencies for Qwen-VL captioner: %s", str(e)
-            )
-        except Exception as e:
-            self.logger.error("Error initializing Qwen-VL captioner: %s", str(e))
-
-    def _prepare_inputs(self, messages: Any) -> Optional[Dict[str, Any]]:
-        """Prepare multimodal inputs for vLLM-based Qwen-VL, following the test notebook."""
-        if self._processor is None or self._process_vision_info is None:
+    def _chat_completions_url(self) -> Optional[str]:
+        """Return full URL to the /v1/chat/completions endpoint, or None if unset."""
+        if not self.server_url:
             return None
 
-        text = self._processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        base = self.server_url.rstrip("/")
+        # Normalize so that we always end with /v1
+        if not base.endswith("/v1"):
+            base = f"{base}/v1"
+        return f"{base}/chat/completions"
 
-        image_inputs, video_inputs, video_kwargs = self._process_vision_info(
-            messages,
-            image_patch_size=self._processor.image_processor.patch_size,
-            return_video_kwargs=True,
-            return_video_metadata=True,
-        )
-
-        mm_data: Dict[str, Any] = {}
-        if image_inputs is not None:
-            mm_data["image"] = image_inputs
-        if video_inputs is not None:
-            mm_data["video"] = video_inputs
-
-        return {
-            "prompt": text,
-            "multi_modal_data": mm_data,
-            "mm_processor_kwargs": video_kwargs,
-        }
+    def _ensure_server_available(self) -> bool:
+        """Check that server URL is configured; log a warning once if not."""
+        if self._chat_completions_url() is None:
+            if not self._unavailable_warned:
+                self.logger.warning(
+                    "qwen_vl_server_url not set in config; image captions will be skipped."
+                )
+                self._unavailable_warned = True
+            return False
+        return True
 
     def caption_image(self, image_path: str) -> str:
         """Generate a short caption for a single image file.
@@ -103,45 +66,92 @@ class QwenVLCaptioner:
         tabular data, generate a brief description of the key information;
         otherwise, return an empty caption (treating "无描述" as empty).
         """
-        self._ensure_initialized()
-        if self._llm is None:
+        if not self._ensure_server_available():
             return ""
 
         if not os.path.exists(image_path):
             self.logger.warning("Image file for captioning not found: %s", image_path)
             return ""
 
-        prompt = (
-            "图片如果包含任何文本或表格数据，生成简短的描述，概述其关键信息；"
-            "如果没有，请返回 '无描述'。"
-        )
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": image_path},
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        ]
+        url = self._chat_completions_url()
+        if url is None:
+            return ""
 
-        inputs = self._prepare_inputs(messages)
-        if inputs is None:
+        prompt = (
+            "图片如果包含任何文本或表格数据，生成简短的描述，概述其关键信息；如果没有任何文字（包括文本、表格数据等），请必须严格返回 '无描述'。"
+        )
+
+        # Encode image as base64 data URL so that the vLLM OpenAI server can
+        # receive it as an `image_url` content block.
+        try:
+            with open(image_path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode("utf-8")
+        except Exception as e:
+            self.logger.error(
+                "Error reading image for captioning %s: %s", image_path, str(e)
+            )
+            return ""
+
+        data_url = f"data:image/png;base64,{b64}"
+
+        payload: Dict[str, Any] = {
+            "model": self.model_name,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ],
+            "max_tokens": 256,
+            "temperature": 0,
+        }
+
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                data=json.dumps(payload),
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            data = response.json()
+        except Exception as e:
+            self.logger.error(
+                "Error calling Qwen-VL vLLM server for %s: %s", image_path, str(e)
+            )
             return ""
 
         try:
-            outputs = self._llm.generate([inputs], sampling_params=self._sampling_params)
-            if not outputs:
+            choices = data.get("choices") or []
+            if not choices:
                 return ""
+            message = choices[0].get("message", {})
+            content = message.get("content")
 
-            generated = outputs[0].outputs[0].text if outputs[0].outputs else ""
+            # vLLM OpenAI server may return either a string or a list of blocks
+            if isinstance(content, str):
+                generated = content
+            else:
+                parts = []
+                for block in content or []:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        parts.append(block.get("text", ""))
+                generated = "".join(parts)
+
             caption = (generated or "").strip().strip("'\"")
             if caption == "无描述":
                 return ""
             return caption
         except Exception as e:
             self.logger.error(
-                "Error generating caption with Qwen-VL for %s: %s", image_path, str(e)
+                "Error parsing Qwen-VL response for %s: %s", image_path, str(e)
             )
             return ""
 

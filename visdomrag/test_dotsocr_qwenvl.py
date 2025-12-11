@@ -6,7 +6,14 @@ import logging
 from visdom import VisDoMRAG
 load_dotenv()
 
-def build_test_config(pdf_path: str, data_dir: str, output_dir: str, qwen_checkpoint: str):
+def build_test_config(
+    pdf_path: str,
+    data_dir: str,
+    output_dir: str,
+    qwen_server_url: str,
+    qwen_model: str,
+    qwen_api_key,
+):
     """Build a minimal config dict for testing DotsOCR + Qwen-VL caption pipeline."""
     pdf_path = os.path.abspath(pdf_path)
     data_dir = os.path.abspath(data_dir)
@@ -35,8 +42,10 @@ def build_test_config(pdf_path: str, data_dir: str, output_dir: str, qwen_checkp
         "dots_num_thread": 64,
         "dots_dpi": 200,
         "dots_prompt_mode": "prompt_layout_all_en",
-        # Qwen-VL caption checkpoint (vLLM model path)
-        "qwen_vl_checkpoint": qwen_checkpoint,
+        # Qwen-VL caption served by external vLLM HTTP server
+        "qwen_vl_server_url": qwen_server_url,
+        "qwen_vl_model": qwen_model,
+        "qwen_vl_api_key": qwen_api_key,
     }
 
 
@@ -58,10 +67,22 @@ def main():
         help="Output directory for DotsOCR and test artifacts",
     )
     parser.add_argument(
-        "--qwen_checkpoint",
+        "--qwen_server_url",
         type=str,
-        required=True,
-        help="Local checkpoint path for Qwen-VL vLLM model (same as in test_qwenvl.ipynb)",
+        default="http://127.0.0.1:9000",
+        help="Base URL of external Qwen-VL vLLM server, e.g. http://127.0.0.1:9000",
+    )
+    parser.add_argument(
+        "--qwen_model",
+        type=str,
+        default="Qwen/Qwen3-VL-4B-Instruct",
+        help="Model name served by vLLM (must match --served-model-name in vllm serve)",
+    )
+    parser.add_argument(
+        "--qwen_api_key",
+        type=str,
+        default=None,
+        help="Optional API key for the vLLM OpenAI server (if configured)",
     )
 
     args = parser.parse_args()
@@ -73,7 +94,9 @@ def main():
         pdf_path=args.pdf_path,
         data_dir=args.data_dir,
         output_dir=args.output_dir,
-        qwen_checkpoint=args.qwen_checkpoint,
+        qwen_server_url=args.qwen_server_url,
+        qwen_model=args.qwen_model,
+        qwen_api_key=args.qwen_api_key,
     )
 
     logger.info("Initializing VisDoMRAG with test config...")
