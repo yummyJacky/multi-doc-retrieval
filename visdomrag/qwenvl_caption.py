@@ -28,7 +28,16 @@ class QwenVLCaptioner:
         api_key: Optional[str] = None,
         timeout: float = 60.0,
     ) -> None:
-        self.server_url = server_url.rstrip("/") if server_url else None
+        # Normalize server URL and ensure it has a scheme so that requests
+        # can create a proper adapter (avoid "No connection adapters" errors
+        # when users pass values like "127.0.0.1:8001").
+        if server_url:
+            s = server_url.strip()
+            if not (s.startswith("http://") or s.startswith("https://")):
+                s = "http://" + s
+            self.server_url = s.rstrip("/")
+        else:
+            self.server_url = None
         self.model_name = model_name
         self.logger = logger
         self.api_key = api_key or os.getenv("QWEN_VL_API_KEY")

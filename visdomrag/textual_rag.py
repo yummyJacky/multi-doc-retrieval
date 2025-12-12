@@ -3,13 +3,15 @@ import os
 import traceback
 import csv
 import uuid
+import re
 
 import chromadb
 import pandas as pd
 import torch
 from chromadb.utils import embedding_functions
 from rank_bm25 import BM25Okapi
-
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from tqdm.auto import tqdm
 
 logger = logging.getLogger("VisDoMRAG")
 
@@ -270,18 +272,91 @@ class TextualRAGEngine:
         all_chunks = []
         chunk_to_doc_mapping = []
         # Build one chunk per document page to align textual retrieval with page-level granularity
-        for doc_id, pages in self.parent.document_cache.items():
+
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=self.config.get("text_chunk_size", 500),
+            chunk_overlap=self.config.get("text_chunk_overlap", 100),
+        )
+
+        # Tables are rendered in markdown as HTML <table>...</table> blocks.
+        # A single page may contain multiple tables, but any presence of a
+        # <table> block means we treat the whole page as one chunk.
+        html_table_pattern = re.compile(r"<table\b.*?</table>", re.IGNORECASE | re.DOTALL)
+
+        image_block_pattern = re.compile(
+            r"!\[[^\]]*\]\([^)]+\)(?:\s*\n\s*caption:.*)?",
+            re.IGNORECASE,
+        )
+
+        for doc_id, pages in tqdm(self.parent.document_cache.items(),desc="Splitting differenct type texts into chunks..."):
             for page_idx, page_text in enumerate(pages):
-                chunk = page_text
-                all_chunks.append(chunk)
-                chunk_to_doc_mapping.append(
-                    {
-                        "chunk": chunk,
-                        "chunk_pdf_name": doc_id,
-                        # Keep page index 0-based to align with visual index page indices
-                        "pdf_page_number": page_idx,
-                    }
-                )
+                text = page_text or ""
+
+                # If the page contains an HTML table block, keep the whole page as a single chunk
+                if html_table_pattern.search(text):
+                    chunk = text
+                    all_chunks.append(chunk)
+                    chunk_to_doc_mapping.append(
+                        {
+                            "chunk": chunk,
+                            "chunk_pdf_name": doc_id,
+                            "pdf_page_number": page_idx,
+                        }
+                    )
+                    continue
+
+                # If the page contains images (with optional captions), keep image path and
+                # caption together as an atomic block, and recursively chunk the surrounding text
+                if image_block_pattern.search(text):
+                    last_idx = 0
+                    for match in image_block_pattern.finditer(text):
+                        prefix = text[last_idx : match.start()]
+                        prefix = prefix.strip()
+                        if prefix:
+                            for chunk in splitter.split_text(prefix):
+                                all_chunks.append(chunk)
+                                chunk_to_doc_mapping.append(
+                                    {
+                                        "chunk": chunk,
+                                        "chunk_pdf_name": doc_id,
+                                        "pdf_page_number": page_idx,
+                                    }
+                                )
+
+                        block = text[match.start() : match.end()].strip()
+                        if block:
+                            all_chunks.append(block)
+                            chunk_to_doc_mapping.append(
+                                {
+                                    "chunk": block,
+                                    "chunk_pdf_name": doc_id,
+                                    "pdf_page_number": page_idx,
+                                }
+                            )
+                        last_idx = match.end()
+
+                    suffix = text[last_idx:].strip()
+                    if suffix:
+                        for chunk in splitter.split_text(suffix):
+                            all_chunks.append(chunk)
+                            chunk_to_doc_mapping.append(
+                                {
+                                    "chunk": chunk,
+                                    "chunk_pdf_name": doc_id,
+                                    "pdf_page_number": page_idx,
+                                }
+                            )
+                else:
+                    # Plain-text pages: use RecursiveCharacterTextSplitter directly
+                    for chunk in splitter.split_text(text):
+                        all_chunks.append(chunk)
+                        chunk_to_doc_mapping.append(
+                            {
+                                "chunk": chunk,
+                                "chunk_pdf_name": doc_id,
+                                "pdf_page_number": page_idx,
+                            }
+                        )
 
         self._text_chunks = all_chunks
         self._text_chunk_mapping = chunk_to_doc_mapping
@@ -399,28 +474,28 @@ class TextualRAGEngine:
             elif self.llm_model == "doubao":
                 # Non-streaming:
                 print("----- standard request -----")
-                # completion = self.llm.chat.completions.create(
-                #     model="doubao-1-5-lite-32k-250115",
-                #     messages=[
-                #         {"role": "user", "content": prompt_template},
-                #     ],
-                # )
-                # return completion.choices[0].message.content
-                response = self.llm.responses.create(
-                    model="doubao-seed-1-6-flash-250828",
-                    input=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "input_text",
-                                    "text": prompt_template,
-                                }
-                            ],
-                        }
+                completion = self.llm.chat.completions.create(
+                    model="doubao-1-5-lite-32k-250115",
+                    messages=[
+                        {"role": "user", "content": prompt_template},
                     ],
                 )
-                return response.output[1].content[0].text
+                return completion.choices[0].message.content
+                # response = self.llm.responses.create(
+                #     model="doubao-seed-1-6-flash-250828",
+                #     input=[
+                #         {
+                #             "role": "user",
+                #             "content": [
+                #                 {
+                #                     "type": "input_text",
+                #                     "text": prompt_template,
+                #                 }
+                #             ],
+                #         }
+                #     ],
+                # )
+                # return response.output[1].content[0].text
 
             elif self.llm_model == "qwen":
                 messages = [

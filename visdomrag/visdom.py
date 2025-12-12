@@ -48,8 +48,6 @@ class VisDoMRAG:
         self.text_retriever = config["text_retriever"]
         self.top_k = config.get("top_k", 5)
         self.api_keys = config.get("api_keys", {})
-        self.chunk_size = config.get("chunk_size", 3000)
-        self.chunk_overlap = config.get("chunk_overlap", 300)
         self.force_reindex = config.get("force_reindex", False)
         self.qa_prompt = config.get("qa_prompt", "Answer the question objectively based on the context provided.")
         self.pdf_files = config.get("pdf_files", [])
@@ -93,9 +91,10 @@ class VisDoMRAG:
         )
         
         # Retrieval engines (lazy init when first used)
-        self.visual_engine = None
-        self.textual_engine = None
-        
+        # self.visual_engine = None
+        # self.textual_engine = None
+        self.visual_engine = VisualRAGEngine(self)
+        self.textual_engine = TextualRAGEngine(self)
     def _initialize_llm(self):
         """Initialize the LLM based on the selected model."""
         if self.llm_model == "doubao":
@@ -408,28 +407,28 @@ class VisDoMRAG:
                 return self.parse_combined_output(response.choices[0].message.content)
                 
             elif self.llm_model == "doubao":
-                # combined_response = self.llm.chat.completions.create(
-                #     model="doubao-1-5-lite-32k-250115",
-                #     messages=[
-                #          {"role": "user", "content": prompt},
-                #     ],
-                # )
-                # return self.parse_combined_output(combined_response.choices[0].message.content)
-                combined_response = self.llm.responses.create(
-                    model="doubao-seed-1-6-flash-250828",
-                    input=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "input_text",
-                                    "text": prompt,
-                                }
-                            ],
-                        }
+                combined_response = self.llm.chat.completions.create(
+                    model="doubao-1-5-lite-32k-250115",
+                    messages=[
+                         {"role": "user", "content": prompt},
                     ],
                 )
-                return self.parse_combined_output(combined_response.output[1].content[0].text)
+                return self.parse_combined_output(combined_response.choices[0].message.content)
+                # combined_response = self.llm.responses.create(
+                #     model="doubao-seed-1-6-flash-250828",
+                #     input=[
+                #         {
+                #             "role": "user",
+                #             "content": [
+                #                 {
+                #                     "type": "input_text",
+                #                     "text": prompt,
+                #                 }
+                #             ],
+                #         }
+                #     ],
+                # )
+                # return self.parse_combined_output(combined_response.output[1].content[0].text)
                 
             elif self.llm_model == "qwen":
                 messages = [
