@@ -185,14 +185,14 @@ if __name__ == "__main__":
         "--text-retriever",
         type=str,
         default="minilm",
-        choices=["minilm", "mpnet", "bge", "bm25"],
+        choices=["minilm", "mpnet", "bge", "bm25", "hybrid"],
         help="Text retriever model to use.",
     )
     parser.add_argument("--top-k", type=int, default=5, help="Number of contexts to retrieve.")
     parser.add_argument(
         "--query",
         type=str,
-        default="截至二零二四年每收入单位的温室气体排放总量是多少？",
+        default="在举报流程中，第四步是什么？",
         help="Query for retrieval tests.",
     )
     parser.add_argument(

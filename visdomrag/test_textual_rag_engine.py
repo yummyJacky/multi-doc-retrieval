@@ -416,8 +416,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--text-retriever",
         type=str,
-        default="minilm",
-        choices=["minilm", "mpnet", "bge", "bm25"],
+        default="hybrid",
+        choices=["minilm", "mpnet", "bge", "bm25", "hybrid"],
         help="Text retriever model to use.",
     )
     parser.add_argument("--top-k", type=int, default=3, help="Number of contexts to retrieve.")

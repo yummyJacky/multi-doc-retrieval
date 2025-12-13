@@ -47,12 +47,14 @@ class TextualRAGEngine:
         if self.text_retriever == "bm25":
             # No model needed for BM25
             self.st_embedding_function = None
-        elif self.text_retriever in ["minilm", "mpnet", "bge"]:
+        elif self.text_retriever in ["minilm", "mpnet", "bge", "hybrid"]:
             # Map text_retriever to actual model names
             model_map = {
                 "minilm": "sentence-transformers/all-MiniLM-L6-v2",
                 "mpnet": "sentence-transformers/all-mpnet-base-v2",
                 "bge": "BAAI/bge-base-en-v1.5",
+                # Hybrid uses MiniLM as the dense encoder
+                "hybrid": "sentence-transformers/all-MiniLM-L6-v2",
             }
 
             # Load sentence transformer model
@@ -71,6 +73,13 @@ class TextualRAGEngine:
         self._text_collection = None
         self._text_chunks = []
         self._text_chunk_mapping = []
+
+    def _rrf_fuse(self, rankings, k=60):
+        fused_scores = {}
+        for ranking in rankings:
+            for idx, rank in ranking.items():
+                fused_scores[idx] = fused_scores.get(idx, 0.0) + 1.0 / (k + rank)
+        return sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
 
     def build_text_index(self):
         """Build text index for all documents in the dataset."""
@@ -138,7 +147,7 @@ class TextualRAGEngine:
                         traceback.print_exc()
 
             elif self.text_retriever in ["minilm", "mpnet", "bge"]:
-                # Create Chroma collection with sentence transformer embeddings
+                # Dense-only retrieval using sentence transformer embeddings
                 chroma_client = chromadb.Client()
                 collection_name = f"st_col_{uuid.uuid4().hex[:8]}"
                 collection = chroma_client.create_collection(
@@ -159,7 +168,7 @@ class TextualRAGEngine:
                     q_id = row["q_id"]
                     question = row["question"]
 
-                    # Get nearest chunks
+                    # Get nearest chunks from dense retriever only
                     try:
                         query_results = collection.query(
                             query_texts=[question],
@@ -185,6 +194,72 @@ class TextualRAGEngine:
                                     "pdf_page_number": chunk_info["pdf_page_number"],
                                     "rank": rank + 1,
                                     "score": 1.0 - score,  # Convert distance to similarity
+                                }
+                            )
+                    except Exception as e:
+                        logger.error(
+                            f"Error processing query {q_id} with {self.text_retriever}: {str(e)}"
+                        )
+                        traceback.print_exc()
+
+            elif self.text_retriever == "hybrid":
+                # Hybrid retrieval: BM25 + dense (MiniLM) with RRF fusion
+                bm25_model = BM25Okapi([chunk.split() for chunk in all_chunks])
+
+                chroma_client = chromadb.Client()
+                collection_name = f"st_col_{uuid.uuid4().hex[:8]}"
+                collection = chroma_client.create_collection(
+                    collection_name,
+                    embedding_function=self.st_embedding_function,
+                    metadata={"hnsw:space": "cosine"},
+                )
+
+                collection.add(
+                    documents=all_chunks,
+                    ids=[f"chunk_{i}" for i in range(len(all_chunks))],
+                )
+
+                results = []
+                for _, row in self.df.iterrows():
+                    q_id = row["q_id"]
+                    question = row["question"]
+
+                    try:
+                        bm25_scores = bm25_model.get_scores(question.split())
+                        bm25_top_indices = sorted(
+                            range(len(bm25_scores)),
+                            key=lambda i: bm25_scores[i],
+                            reverse=True,
+                        )[: self.top_k]
+                        bm25_ranking = {
+                            idx: rank + 1 for rank, idx in enumerate(bm25_top_indices)
+                        }
+
+                        query_results = collection.query(
+                            query_texts=[question],
+                            n_results=self.top_k,
+                        )
+                        dense_indices = [
+                            int(id.split("_")[1]) for id in query_results["ids"][0]
+                        ]
+                        dense_ranking = {
+                            idx: rank + 1 for rank, idx in enumerate(dense_indices)
+                        }
+
+                        fused = self._rrf_fuse([bm25_ranking, dense_ranking])
+                        top_fused = fused[: self.top_k * 2]
+
+                        for rank, (idx, fused_score) in enumerate(top_fused):
+                            chunk_info = chunk_to_doc_mapping[idx]
+                            results.append(
+                                {
+                                    "q_id": q_id,
+                                    "question": question,
+                                    "chunk": all_chunks[idx],
+                                    "chunk_pdf_name": chunk_info["chunk_pdf_name"],
+                                    "pdf_page_number": chunk_info["pdf_page_number"],
+                                    "rank": rank + 1,
+                                    "score": fused_score,
                                 }
                             )
                     except Exception as e:
@@ -306,38 +381,39 @@ class TextualRAGEngine:
                     continue
 
                 # If the page contains images (with optional captions), keep image path and
-                # caption together as an atomic block, and recursively chunk the surrounding text
+                # caption together as atomic blocks, but treat all surrounding text on the page as a single continuous stream before chunking. This avoids splitting
+                # pure-text content into separate chunks just because an image appears in the middle of the page.
                 if image_block_pattern.search(text):
                     last_idx = 0
-                    for match in image_block_pattern.finditer(text):
-                        prefix = text[last_idx : match.start()]
-                        prefix = prefix.strip()
-                        if prefix:
-                            for chunk in splitter.split_text(prefix):
-                                all_chunks.append(chunk)
-                                chunk_to_doc_mapping.append(
-                                    {
-                                        "chunk": chunk,
-                                        "chunk_pdf_name": doc_id,
-                                        "pdf_page_number": page_idx,
-                                    }
-                                )
+                    text_segments = []
+                    image_blocks = []
 
-                        block = text[match.start() : match.end()].strip()
-                        if block:
-                            all_chunks.append(block)
-                            chunk_to_doc_mapping.append(
-                                {
-                                    "chunk": block,
-                                    "chunk_pdf_name": doc_id,
-                                    "pdf_page_number": page_idx,
-                                }
-                            )
+                    for match in image_block_pattern.finditer(text):
+                        # Text segment before this image
+                        if match.start() > last_idx:
+                            prefix = text[last_idx:match.start()]
+                            if prefix.strip():
+                                text_segments.append(prefix)
+
+                        # The image block itself (URL + optional caption)
+                        block = text[match.start():match.end()]
+                        if block.strip():
+                            image_blocks.append(block.strip())
+
                         last_idx = match.end()
 
-                    suffix = text[last_idx:].strip()
-                    if suffix:
-                        for chunk in splitter.split_text(suffix):
+                    # Trailing text after the last image
+                    if last_idx < len(text):
+                        suffix = text[last_idx:]
+                        if suffix.strip():
+                            text_segments.append(suffix)
+
+                    # Merge all pure-text segments on the page into a single logical stream
+                    # and then chunk it. This way, text before and after images can end up
+                    # in the same chunk if the page is not too long.
+                    if text_segments:
+                        merged_text = "\n".join(seg.strip() for seg in text_segments)
+                        for chunk in splitter.split_text(merged_text):
                             all_chunks.append(chunk)
                             chunk_to_doc_mapping.append(
                                 {
@@ -346,6 +422,17 @@ class TextualRAGEngine:
                                     "pdf_page_number": page_idx,
                                 }
                             )
+
+                    # Add image blocks as independent chunks so their URL+caption remain atomic
+                    for block in image_blocks:
+                        all_chunks.append(block)
+                        chunk_to_doc_mapping.append(
+                            {
+                                "chunk": block,
+                                "chunk_pdf_name": doc_id,
+                                "pdf_page_number": page_idx,
+                            }
+                        )
                 else:
                     # Plain-text pages: use RecursiveCharacterTextSplitter directly
                     for chunk in splitter.split_text(text):
@@ -361,9 +448,11 @@ class TextualRAGEngine:
         self._text_chunks = all_chunks
         self._text_chunk_mapping = chunk_to_doc_mapping
         logger.info(f"Built interactive text index with {len(all_chunks)} chunks")
-        if self.text_retriever == "bm25":
+        # BM25 index is needed for bm25 and hybrid modes
+        if self.text_retriever in ["bm25", "hybrid"]:
             self._bm25_model = BM25Okapi([chunk.split() for chunk in all_chunks])
-        elif self.text_retriever in ["minilm", "mpnet", "bge"]:
+        # Dense index is needed for dense-only and hybrid modes
+        if self.text_retriever in ["minilm", "mpnet", "bge", "hybrid"]:
             chroma_client = chromadb.Client()
             collection_name = f"st_col_{uuid.uuid4().hex[:8]}"
             collection = chroma_client.create_collection(
@@ -402,6 +491,7 @@ class TextualRAGEngine:
                         }
                     )
             elif self.text_retriever in ["minilm", "mpnet", "bge"]:
+                # Dense-only interactive retrieval
                 query_results = self._text_collection.query(
                     query_texts=[question],
                     n_results=self.top_k,
@@ -414,6 +504,38 @@ class TextualRAGEngine:
                     contexts.append(
                         {
                             "chunk": self._text_chunks[chunk_idx],
+                            "chunk_pdf_name": chunk_info["chunk_pdf_name"],
+                            "pdf_page_number": chunk_info["pdf_page_number"],
+                        }
+                    )
+            elif self.text_retriever == "hybrid":
+                # Hybrid interactive retrieval: BM25 + dense with RRF fusion
+                bm25_scores = self._bm25_model.get_scores(question.split())
+                bm25_top_indices = sorted(
+                    range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True
+                )[: self.top_k * 2]
+                bm25_ranking = {
+                    idx: rank + 1 for rank, idx in enumerate(bm25_top_indices)
+                }
+
+                query_results = self._text_collection.query(
+                    query_texts=[question],
+                    n_results=self.top_k,
+                )
+                dense_indices = [
+                    int(id.split("_")[1]) for id in query_results["ids"][0]
+                ]
+                dense_ranking = {
+                    idx: rank + 1 for rank, idx in enumerate(dense_indices)
+                }
+
+                fused = self._rrf_fuse([bm25_ranking, dense_ranking])
+                top_indices = [idx for idx, _ in fused[: self.top_k]]
+                for idx in top_indices:
+                    chunk_info = self._text_chunk_mapping[idx]
+                    contexts.append(
+                        {
+                            "chunk": self._text_chunks[idx],
                             "chunk_pdf_name": chunk_info["chunk_pdf_name"],
                             "pdf_page_number": chunk_info["pdf_page_number"],
                         }
@@ -474,28 +596,28 @@ class TextualRAGEngine:
             elif self.llm_model == "doubao":
                 # Non-streaming:
                 print("----- standard request -----")
-                completion = self.llm.chat.completions.create(
-                    model="doubao-1-5-lite-32k-250115",
-                    messages=[
-                        {"role": "user", "content": prompt_template},
-                    ],
-                )
-                return completion.choices[0].message.content
-                # response = self.llm.responses.create(
-                #     model="doubao-seed-1-6-flash-250828",
-                #     input=[
-                #         {
-                #             "role": "user",
-                #             "content": [
-                #                 {
-                #                     "type": "input_text",
-                #                     "text": prompt_template,
-                #                 }
-                #             ],
-                #         }
+                # completion = self.llm.chat.completions.create(
+                #     model="doubao-1-5-lite-32k-250115",
+                #     messages=[
+                #         {"role": "user", "content": prompt_template},
                 #     ],
                 # )
-                # return response.output[1].content[0].text
+                # return completion.choices[0].message.content
+                response = self.llm.responses.create(
+                    model="doubao-seed-1-6-flash-250828",
+                    input=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": prompt_template,
+                                }
+                            ],
+                        }
+                    ],
+                )
+                return response.output[1].content[0].text
 
             elif self.llm_model == "qwen":
                 messages = [
