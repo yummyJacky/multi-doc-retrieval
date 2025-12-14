@@ -2,7 +2,7 @@ import os
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 import argparse
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 
 from visdom import VisDoMRAG, TextualRAGEngine
 from dotenv import load_dotenv
@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-def build_visdom_for_pdf(pdf_path: str, args: argparse.Namespace) -> VisDoMRAG:
+def build_visdom_for_pdf(pdf_path: List[str], args: argparse.Namespace) -> VisDoMRAG:
     """Construct a VisDoMRAG instance for a single-PDF textual test.
 
     This reuses VisDoMRAG's internal implementations of _initialize_llm,
@@ -18,7 +18,7 @@ def build_visdom_for_pdf(pdf_path: str, args: argparse.Namespace) -> VisDoMRAG:
     them in the test suite.
     """
 
-    data_dir = str(Path(pdf_path).parent)
+    data_dir = str(Path(pdf_path[0]).parent)
     output_dir = str(Path(data_dir) / "visdom_text_test_output")
     os.makedirs(output_dir, exist_ok=True)
 
@@ -28,14 +28,14 @@ def build_visdom_for_pdf(pdf_path: str, args: argparse.Namespace) -> VisDoMRAG:
         "llm_model": args.llm_model,
         "vision_retriever": "nemo",
         "text_retriever": args.text_retriever,
-        "top_k": args.top_k,
+        "top_k": args.top_k*len(pdf_path),
         "api_keys": {
             "openai": getattr(args, "openai_api_key", None),
             "doubao": args.doubao_api_key,
         },
         "force_reindex": False,
         "qa_prompt": "Answer the question based on the document text.",
-        "pdf_files": [pdf_path],
+        "pdf_files": pdf_path,
         "csv_path": None,
         "ocr_engine": "dots",
         "dots_max_completion_tokens": 4096,
@@ -63,10 +63,10 @@ def test_textual_retrieval(args: argparse.Namespace) -> None:
         "VISDOM_TEXT_TEST_PDF",
         "/home/zechuan/m3docrag/contents/2024_Tencent_ESG.pdf",
     )
-
-    if not os.path.exists(pdf_path):
-        print(f"[SKIP] PDF file not found: {pdf_path}")
-        return
+    for pdf in pdf_path:
+        if not os.path.exists(pdf):
+            print(f"[SKIP] PDF file not found: {pdf}")
+            return
 
     try:
         visdom = build_visdom_for_pdf(pdf_path, args)
@@ -174,11 +174,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run tests for TextualRAGEngine.")
     parser.add_argument(
         "--pdf-path",
-        type=str,
-        default=os.environ.get(
-            "VISDOM_TEXT_TEST_PDF",
+        type=List[str],
+        default=[
             "/home/zechuan/m3docrag/contents/2024_Tencent_ESG.pdf",
-        ),
+            "/home/zechuan/m3docrag/contents/2024_sanqi_ESG.pdf",
+            "/home/zechuan/m3docrag/contents/2024_architecture_ESG.pdf",
+        ],
         help="Path to the PDF file for integration tests.",
     )
     parser.add_argument(
@@ -192,7 +193,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--query",
         type=str,
-        default="在举报流程中，第四步是什么？",
+        default="三家公司的2024年男性员工数量分别是多少？", #"在反舞弊举报及调查中，包含哪些操作？",
         help="Query for retrieval tests.",
     )
     parser.add_argument(

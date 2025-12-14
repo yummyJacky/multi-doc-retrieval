@@ -9,11 +9,95 @@ import chromadb
 import pandas as pd
 import torch
 from chromadb.utils import embedding_functions
-from rank_bm25 import BM25Okapi
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from tqdm.auto import tqdm
+from sentence_transformers import CrossEncoder
 
 logger = logging.getLogger("VisDoMRAG")
+
+
+class SimpleBM25:
+    def __init__(self, documents):
+        self.documents = documents or []
+        self._build_index()
+
+    def _tokenize(self, text):
+        import re
+        import jieba
+
+        chinese_pattern = r"[\u4e00-\u9fff]+"
+        chinese_parts = re.findall(chinese_pattern, text)
+        non_chinese_text = re.sub(chinese_pattern, " ", text)
+
+        tokens = []
+
+        for chinese_part in chinese_parts:
+            chinese_tokens = list(jieba.cut(chinese_part, cut_all=False))
+            tokens.extend([token.strip() for token in chinese_tokens if token.strip()])
+
+        english_tokens = re.findall(r"[a-zA-Z]+|\d+", non_chinese_text.lower())
+        tokens.extend(english_tokens)
+
+        filtered_tokens = []
+        for token in tokens:
+            if token and (len(token) > 1 or token.isdigit()):
+                filtered_tokens.append(token)
+
+        return filtered_tokens
+
+    def _build_index(self):
+        from collections import defaultdict, Counter
+
+        self.keyword_index = defaultdict(list)
+        self.doc_lengths = []
+
+        for i, doc in enumerate(self.documents):
+            content = doc or ""
+            tokens = self._tokenize(content)
+            self.doc_lengths.append(len(tokens))
+
+            token_counts = Counter(tokens)
+            for token, count in token_counts.items():
+                self.keyword_index[token].append((i, count))
+
+        self.N = len(self.documents)
+        self.avg_doc_length = (
+            sum(self.doc_lengths) / len(self.doc_lengths) if self.doc_lengths else 0.0
+        )
+
+    def get_scores(self, query):
+        import math
+
+        if not self.documents:
+            return []
+
+        if isinstance(query, str):
+            query_tokens = self._tokenize(query)
+        else:
+            query_tokens = [t for t in query if t]
+
+        if not query_tokens:
+            return [0.0] * self.N
+
+        k1, b = 1.5, 0.75
+        scores = [0.0] * self.N
+        avg_dl = self.avg_doc_length or 1.0
+
+        for token in query_tokens:
+            if token not in self.keyword_index:
+                continue
+
+            doc_entries = self.keyword_index[token]
+            df = len(doc_entries)
+            idf = math.log((self.N - df + 0.5) / (df + 0.5) + 1.0)
+
+            for doc_idx, tf in doc_entries:
+                doc_len = self.doc_lengths[doc_idx]
+                denom = tf + k1 * (1 - b + b * doc_len / avg_dl)
+                score = idf * (tf * (k1 + 1)) / denom
+                scores[doc_idx] += score
+
+        return scores
 
 
 class TextualRAGEngine:
@@ -50,11 +134,11 @@ class TextualRAGEngine:
         elif self.text_retriever in ["minilm", "mpnet", "bge", "hybrid"]:
             # Map text_retriever to actual model names
             model_map = {
-                "minilm": "sentence-transformers/all-MiniLM-L6-v2",
+                "minilm": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",#"sentence-transformers/all-MiniLM-L6-v2",
                 "mpnet": "sentence-transformers/all-mpnet-base-v2",
                 "bge": "BAAI/bge-base-en-v1.5",
                 # Hybrid uses MiniLM as the dense encoder
-                "hybrid": "sentence-transformers/all-MiniLM-L6-v2",
+                "hybrid": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
             }
 
             # Load sentence transformer model
@@ -65,6 +149,26 @@ class TextualRAGEngine:
             )
         else:
             raise ValueError(f"Unsupported text retriever: {self.text_retriever}")
+
+        # Optional CrossEncoder-based reranking
+        self.use_rerank = self.config.get("text_use_rerank", False)
+        # How many candidates to send to the CrossEncoder for reranking
+        self.rerank_top_k = self.config.get("text_rerank_top_k", self.top_k * 2)
+        self.rerank_model_name = self.config.get(
+            "text_rerank_model", "cross-encoder/ms-marco-MiniLM-L6-v2"
+        )
+        self.cross_encoder = None
+        if self.use_rerank:
+            try:
+                rerank_device = "cuda" if torch.cuda.is_available() else "cpu"
+                self.cross_encoder = CrossEncoder(self.rerank_model_name, device=rerank_device)
+                logger.info(
+                    f"Initialized CrossEncoder reranker {self.rerank_model_name} on {rerank_device}"
+                )
+            except Exception as e:
+                logger.error(f"Failed to initialize CrossEncoder for reranking: {str(e)}")
+                traceback.print_exc()
+                self.use_rerank = False
 
         # Interactive text index state
         self._text_index_built = False
@@ -80,6 +184,31 @@ class TextualRAGEngine:
             for idx, rank in ranking.items():
                 fused_scores[idx] = fused_scores.get(idx, 0.0) + 1.0 / (k + rank)
         return sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
+
+    def _rerank_contexts(self, question, contexts):
+        """Optionally rerank contexts using a CrossEncoder.
+
+        Each element in contexts is expected to be a dict with at least a
+        "chunk" field containing the text to be scored.
+        """
+        if not self.use_rerank or self.cross_encoder is None or not contexts:
+            return contexts
+
+        try:
+            top_n = min(len(contexts), self.rerank_top_k)
+            candidate_contexts = contexts[:top_n]
+            pairs = [(question, ctx["chunk"]) for ctx in candidate_contexts]
+            scores = self.cross_encoder.predict(pairs)
+
+            for ctx, score in zip(candidate_contexts, scores):
+                ctx["_rerank_score"] = float(score)
+
+            candidate_contexts.sort(key=lambda x: x.get("_rerank_score", 0.0), reverse=True)
+            return candidate_contexts
+        except Exception as e:
+            logger.error(f"Error during CrossEncoder reranking: {str(e)}")
+            traceback.print_exc()
+            return contexts
 
     def build_text_index(self):
         """Build text index for all documents in the dataset."""
@@ -110,7 +239,8 @@ class TextualRAGEngine:
             # Initialize retriever based on selected method
             if self.text_retriever == "bm25":
                 # BM25 indexing
-                bm25_model = BM25Okapi([chunk.split() for chunk in all_chunks])
+                # bm25_model = BM25Okapi([chunk.split() for chunk in all_chunks])
+                bm25_model = SimpleBM25(all_chunks)
 
                 # Process each query
                 results = []
@@ -120,24 +250,39 @@ class TextualRAGEngine:
 
                     # Get BM25 scores
                     try:
-                        scores = bm25_model.get_scores(question.split())
+                        scores = bm25_model.get_scores(question)
+                        pre_k = self.rerank_top_k if self.use_rerank else self.top_k * 2
                         top_indices = sorted(
                             range(len(scores)),
                             key=lambda i: scores[i],
                             reverse=True,
-                        )[: self.top_k * 2]
+                        )[: pre_k]
 
-                        for rank, idx in enumerate(top_indices):
+                        contexts = []
+                        for idx in top_indices:
                             chunk_info = chunk_to_doc_mapping[idx]
+                            contexts.append(
+                                {
+                                    "chunk": all_chunks[idx],
+                                    "chunk_pdf_name": chunk_info["chunk_pdf_name"],
+                                    "pdf_page_number": chunk_info["pdf_page_number"],
+                                    "_base_score": scores[idx],
+                                }
+                            )
+
+                        contexts = self._rerank_contexts(question, contexts)
+                        contexts = contexts[: self.top_k * 2]
+
+                        for rank, ctx in enumerate(contexts):
                             results.append(
                                 {
                                     "q_id": q_id,
                                     "question": question,
-                                    "chunk": all_chunks[idx],
-                                    "chunk_pdf_name": chunk_info["chunk_pdf_name"],
-                                    "pdf_page_number": chunk_info["pdf_page_number"],
+                                    "chunk": ctx["chunk"],
+                                    "chunk_pdf_name": ctx["chunk_pdf_name"],
+                                    "pdf_page_number": ctx["pdf_page_number"],
                                     "rank": rank + 1,
-                                    "score": scores[idx],
+                                    "score": ctx.get("_rerank_score", ctx.get("_base_score", 0.0)),
                                 }
                             )
                     except Exception as e:
@@ -170,30 +315,43 @@ class TextualRAGEngine:
 
                     # Get nearest chunks from dense retriever only
                     try:
+                        pre_k = self.rerank_top_k if self.use_rerank else self.top_k * 2
                         query_results = collection.query(
                             query_texts=[question],
-                            n_results=self.top_k * 2,
+                            n_results=pre_k,
                         )
 
-                        for rank, (chunk_idx, score) in enumerate(
-                            zip(
-                                [
-                                    int(id.split("_")[1])
-                                    for id in query_results["ids"][0]
-                                ],
-                                query_results["distances"][0],
-                            )
+                        contexts = []
+                        for chunk_idx, score in zip(
+                            [
+                                int(id.split("_")[1])
+                                for id in query_results["ids"][0]
+                            ],
+                            query_results["distances"][0],
                         ):
                             chunk_info = chunk_to_doc_mapping[chunk_idx]
+                            contexts.append(
+                                {
+                                    "chunk": all_chunks[chunk_idx],
+                                    "chunk_pdf_name": chunk_info["chunk_pdf_name"],
+                                    "pdf_page_number": chunk_info["pdf_page_number"],
+                                    "_base_score": 1.0 - score,
+                                }
+                            )
+
+                        contexts = self._rerank_contexts(question, contexts)
+                        contexts = contexts[: self.top_k * 2]
+
+                        for rank, ctx in enumerate(contexts):
                             results.append(
                                 {
                                     "q_id": q_id,
                                     "question": question,
-                                    "chunk": all_chunks[chunk_idx],
-                                    "chunk_pdf_name": chunk_info["chunk_pdf_name"],
-                                    "pdf_page_number": chunk_info["pdf_page_number"],
+                                    "chunk": ctx["chunk"],
+                                    "chunk_pdf_name": ctx["chunk_pdf_name"],
+                                    "pdf_page_number": ctx["pdf_page_number"],
                                     "rank": rank + 1,
-                                    "score": 1.0 - score,  # Convert distance to similarity
+                                    "score": ctx.get("_rerank_score", ctx.get("_base_score", 0.0)),
                                 }
                             )
                     except Exception as e:
@@ -204,7 +362,8 @@ class TextualRAGEngine:
 
             elif self.text_retriever == "hybrid":
                 # Hybrid retrieval: BM25 + dense (MiniLM) with RRF fusion
-                bm25_model = BM25Okapi([chunk.split() for chunk in all_chunks])
+                # bm25_model = BM25Okapi([chunk.split() for chunk in all_chunks])
+                bm25_model = SimpleBM25(all_chunks)
 
                 chroma_client = chromadb.Client()
                 collection_name = f"st_col_{uuid.uuid4().hex[:8]}"
@@ -225,19 +384,20 @@ class TextualRAGEngine:
                     question = row["question"]
 
                     try:
-                        bm25_scores = bm25_model.get_scores(question.split())
+                        bm25_scores = bm25_model.get_scores(question)
+                        pre_k = self.rerank_top_k if self.use_rerank else self.top_k
                         bm25_top_indices = sorted(
                             range(len(bm25_scores)),
                             key=lambda i: bm25_scores[i],
                             reverse=True,
-                        )[: self.top_k]
+                        )[: pre_k]
                         bm25_ranking = {
                             idx: rank + 1 for rank, idx in enumerate(bm25_top_indices)
                         }
 
                         query_results = collection.query(
                             query_texts=[question],
-                            n_results=self.top_k,
+                            n_results=pre_k,
                         )
                         dense_indices = [
                             int(id.split("_")[1]) for id in query_results["ids"][0]
@@ -247,19 +407,33 @@ class TextualRAGEngine:
                         }
 
                         fused = self._rrf_fuse([bm25_ranking, dense_ranking])
-                        top_fused = fused[: self.top_k * 2]
+                        top_fused = fused[: pre_k]
 
-                        for rank, (idx, fused_score) in enumerate(top_fused):
+                        contexts = []
+                        for idx, fused_score in top_fused:
                             chunk_info = chunk_to_doc_mapping[idx]
+                            contexts.append(
+                                {
+                                    "chunk": all_chunks[idx],
+                                    "chunk_pdf_name": chunk_info["chunk_pdf_name"],
+                                    "pdf_page_number": chunk_info["pdf_page_number"],
+                                    "_base_score": fused_score,
+                                }
+                            )
+
+                        contexts = self._rerank_contexts(question, contexts)
+                        contexts = contexts[: self.top_k * 2]
+
+                        for rank, ctx in enumerate(contexts):
                             results.append(
                                 {
                                     "q_id": q_id,
                                     "question": question,
-                                    "chunk": all_chunks[idx],
-                                    "chunk_pdf_name": chunk_info["chunk_pdf_name"],
-                                    "pdf_page_number": chunk_info["pdf_page_number"],
+                                    "chunk": ctx["chunk"],
+                                    "chunk_pdf_name": ctx["chunk_pdf_name"],
+                                    "pdf_page_number": ctx["pdf_page_number"],
                                     "rank": rank + 1,
-                                    "score": fused_score,
+                                    "score": ctx.get("_rerank_score", ctx.get("_base_score", 0.0)),
                                 }
                             )
                     except Exception as e:
@@ -449,23 +623,25 @@ class TextualRAGEngine:
         self._text_chunk_mapping = chunk_to_doc_mapping
         logger.info(f"Built interactive text index with {len(all_chunks)} chunks")
         # BM25 index is needed for bm25 and hybrid modes
-        if self.text_retriever in ["bm25", "hybrid"]:
-            self._bm25_model = BM25Okapi([chunk.split() for chunk in all_chunks])
-        # Dense index is needed for dense-only and hybrid modes
-        if self.text_retriever in ["minilm", "mpnet", "bge", "hybrid"]:
-            chroma_client = chromadb.Client()
-            collection_name = f"st_col_{uuid.uuid4().hex[:8]}"
-            collection = chroma_client.create_collection(
-                collection_name,
-                embedding_function=self.st_embedding_function,
-                metadata={"hnsw:space": "cosine"},
-            )
-            collection.add(
-                documents=all_chunks,
-                ids=[f"chunk_{i}" for i in range(len(all_chunks))],
-            )
-            self._chroma_client = chroma_client
-            self._text_collection = collection
+        if self.text_retriever in ["bm25", "minilm", "mpnet", "bge", "hybrid"]:
+            if self.text_retriever in ["bm25", "hybrid"]:
+                # self._bm25_model = BM25Okapi([chunk.split() for chunk in all_chunks])
+                self._bm25_model = SimpleBM25(all_chunks)
+            # Dense index is needed for dense-only and hybrid modes
+            if self.text_retriever in ["minilm", "mpnet", "bge", "hybrid"]:
+                chroma_client = chromadb.Client()
+                collection_name = f"st_col_{uuid.uuid4().hex[:8]}"
+                collection = chroma_client.create_collection(
+                    collection_name,
+                    embedding_function=self.st_embedding_function,
+                    metadata={"hnsw:space": "cosine"},
+                )
+                collection.add(
+                    documents=all_chunks,
+                    ids=[f"chunk_{i}" for i in range(len(all_chunks))],
+                )
+                self._chroma_client = chroma_client
+                self._text_collection = collection
         else:
             raise ValueError(f"Unsupported text retriever: {self.text_retriever}")
         self._text_index_built = True
@@ -477,10 +653,11 @@ class TextualRAGEngine:
                 return []
             contexts = []
             if self.text_retriever == "bm25":
-                scores = self._bm25_model.get_scores(question.split())
+                scores = self._bm25_model.get_scores(question)
+                pre_k = self.rerank_top_k if self.use_rerank else self.top_k
                 top_indices = sorted(
                     range(len(scores)), key=lambda i: scores[i], reverse=True
-                )[: self.top_k]
+                )[: pre_k]
                 for idx in top_indices:
                     chunk_info = self._text_chunk_mapping[idx]
                     contexts.append(
@@ -492,9 +669,10 @@ class TextualRAGEngine:
                     )
             elif self.text_retriever in ["minilm", "mpnet", "bge"]:
                 # Dense-only interactive retrieval
+                pre_k = self.rerank_top_k if self.use_rerank else self.top_k
                 query_results = self._text_collection.query(
                     query_texts=[question],
-                    n_results=self.top_k,
+                    n_results=pre_k,
                 )
                 for chunk_idx, score in zip(
                     [int(id.split("_")[1]) for id in query_results["ids"][0]],
@@ -510,10 +688,12 @@ class TextualRAGEngine:
                     )
             elif self.text_retriever == "hybrid":
                 # Hybrid interactive retrieval: BM25 + dense with RRF fusion
-                bm25_scores = self._bm25_model.get_scores(question.split())
+                bm25_scores = self._bm25_model.get_scores(question)
+                pre_k = self.rerank_top_k if self.use_rerank else self.top_k * 2
+
                 bm25_top_indices = sorted(
                     range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True
-                )[: self.top_k * 2]
+                )[: pre_k]
                 bm25_ranking = {
                     idx: rank + 1 for rank, idx in enumerate(bm25_top_indices)
                 }
@@ -530,7 +710,7 @@ class TextualRAGEngine:
                 }
 
                 fused = self._rrf_fuse([bm25_ranking, dense_ranking])
-                top_indices = [idx for idx, _ in fused[: self.top_k]]
+                top_indices = [idx for idx, _ in fused[: pre_k]]
                 for idx in top_indices:
                     chunk_info = self._text_chunk_mapping[idx]
                     contexts.append(
@@ -542,6 +722,11 @@ class TextualRAGEngine:
                     )
             else:
                 return []
+
+            # Optional CrossEncoder reranking of interactive contexts
+            contexts = self._rerank_contexts(question, contexts)
+            if len(contexts) > self.top_k:
+                contexts = contexts[: self.top_k]
             logger.info(
                 "Retrieved %d textual contexts for interactive query", len(contexts)
             )

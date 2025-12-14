@@ -1,6 +1,7 @@
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.environ["CUDA_VISIBLE_DEVICES"] = "9"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import json
 import torch
 import pandas as pd
