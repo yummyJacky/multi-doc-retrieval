@@ -9,7 +9,7 @@ import chromadb
 import pandas as pd
 import torch
 from chromadb.utils import embedding_functions
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.text_splitter import RecursiveCharacterTextSplitter, Language
 from tqdm.auto import tqdm
 from sentence_transformers import CrossEncoder
 
@@ -130,13 +130,15 @@ class TextualRAGEngine:
 
         if self.text_retriever == "bm25":
             # No model needed for BM25
+            print("Using BM25 for text retrieval")
             self.st_embedding_function = None
         elif self.text_retriever in ["minilm", "mpnet", "bge", "hybrid"]:
             # Map text_retriever to actual model names
+            print(f"Using {self.text_retriever} for text retrieval")
             model_map = {
                 "minilm": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",#"sentence-transformers/all-MiniLM-L6-v2",
                 "mpnet": "sentence-transformers/all-mpnet-base-v2",
-                "bge": "BAAI/bge-base-en-v1.5",
+                "bge": "BAAI/bge-large-zh-v1.5",
                 # Hybrid uses MiniLM as the dense encoder
                 "hybrid": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
             }
@@ -154,8 +156,9 @@ class TextualRAGEngine:
         self.use_rerank = self.config.get("text_use_rerank", False)
         # How many candidates to send to the CrossEncoder for reranking
         self.rerank_top_k = self.config.get("text_rerank_top_k", self.top_k * 2)
+        # "cross-encoder/ms-marco-MiniLM-L6-v2"
         self.rerank_model_name = self.config.get(
-            "text_rerank_model", "cross-encoder/ms-marco-MiniLM-L6-v2"
+            "text_rerank_model", "cross-encoder/ms-marco-MiniLM-L12-v2"
         )
         self.cross_encoder = None
         if self.use_rerank:
@@ -195,6 +198,7 @@ class TextualRAGEngine:
             return contexts
 
         try:
+            print(f"Reranking {len(contexts)} contexts for question: {question}")
             top_n = min(len(contexts), self.rerank_top_k)
             candidate_contexts = contexts[:top_n]
             pairs = [(question, ctx["chunk"]) for ctx in candidate_contexts]
@@ -251,38 +255,23 @@ class TextualRAGEngine:
                     # Get BM25 scores
                     try:
                         scores = bm25_model.get_scores(question)
-                        pre_k = self.rerank_top_k if self.use_rerank else self.top_k * 2
                         top_indices = sorted(
                             range(len(scores)),
                             key=lambda i: scores[i],
                             reverse=True,
-                        )[: pre_k]
+                        )[: self.top_k * 2]
 
-                        contexts = []
-                        for idx in top_indices:
+                        for rank, idx in enumerate(top_indices):
                             chunk_info = chunk_to_doc_mapping[idx]
-                            contexts.append(
-                                {
-                                    "chunk": all_chunks[idx],
-                                    "chunk_pdf_name": chunk_info["chunk_pdf_name"],
-                                    "pdf_page_number": chunk_info["pdf_page_number"],
-                                    "_base_score": scores[idx],
-                                }
-                            )
-
-                        contexts = self._rerank_contexts(question, contexts)
-                        contexts = contexts[: self.top_k * 2]
-
-                        for rank, ctx in enumerate(contexts):
                             results.append(
                                 {
                                     "q_id": q_id,
                                     "question": question,
-                                    "chunk": ctx["chunk"],
-                                    "chunk_pdf_name": ctx["chunk_pdf_name"],
-                                    "pdf_page_number": ctx["pdf_page_number"],
+                                    "chunk": all_chunks[idx],
+                                    "chunk_pdf_name": chunk_info["chunk_pdf_name"],
+                                    "pdf_page_number": chunk_info["pdf_page_number"],
                                     "rank": rank + 1,
-                                    "score": ctx.get("_rerank_score", ctx.get("_base_score", 0.0)),
+                                    "score": scores[idx],
                                 }
                             )
                     except Exception as e:
@@ -315,43 +304,31 @@ class TextualRAGEngine:
 
                     # Get nearest chunks from dense retriever only
                     try:
-                        pre_k = self.rerank_top_k if self.use_rerank else self.top_k * 2
                         query_results = collection.query(
                             query_texts=[question],
-                            n_results=pre_k,
+                            n_results=self.top_k * 2,
                         )
 
-                        contexts = []
-                        for chunk_idx, score in zip(
-                            [
-                                int(id.split("_")[1])
-                                for id in query_results["ids"][0]
-                            ],
-                            query_results["distances"][0],
+                        for rank, (chunk_idx, score) in enumerate(
+                            zip(
+                                [
+                                    int(id.split("_")[1])
+                                    for id in query_results["ids"][0]
+                                ],
+                                query_results["distances"][0],
+                            )
                         ):
                             chunk_info = chunk_to_doc_mapping[chunk_idx]
-                            contexts.append(
-                                {
-                                    "chunk": all_chunks[chunk_idx],
-                                    "chunk_pdf_name": chunk_info["chunk_pdf_name"],
-                                    "pdf_page_number": chunk_info["pdf_page_number"],
-                                    "_base_score": 1.0 - score,
-                                }
-                            )
-
-                        contexts = self._rerank_contexts(question, contexts)
-                        contexts = contexts[: self.top_k * 2]
-
-                        for rank, ctx in enumerate(contexts):
                             results.append(
                                 {
                                     "q_id": q_id,
                                     "question": question,
-                                    "chunk": ctx["chunk"],
-                                    "chunk_pdf_name": ctx["chunk_pdf_name"],
-                                    "pdf_page_number": ctx["pdf_page_number"],
+                                    "chunk": all_chunks[chunk_idx],
+                                    "chunk_pdf_name": chunk_info["chunk_pdf_name"],
+                                    "pdf_page_number": chunk_info["pdf_page_number"],
                                     "rank": rank + 1,
-                                    "score": ctx.get("_rerank_score", ctx.get("_base_score", 0.0)),
+                                    # Convert distance to similarity
+                                    "score": 1.0 - score,
                                 }
                             )
                     except Exception as e:
@@ -385,19 +362,18 @@ class TextualRAGEngine:
 
                     try:
                         bm25_scores = bm25_model.get_scores(question)
-                        pre_k = self.rerank_top_k if self.use_rerank else self.top_k
                         bm25_top_indices = sorted(
                             range(len(bm25_scores)),
                             key=lambda i: bm25_scores[i],
                             reverse=True,
-                        )[: pre_k]
+                        )[: self.top_k]
                         bm25_ranking = {
                             idx: rank + 1 for rank, idx in enumerate(bm25_top_indices)
                         }
 
                         query_results = collection.query(
                             query_texts=[question],
-                            n_results=pre_k,
+                            n_results=self.top_k,
                         )
                         dense_indices = [
                             int(id.split("_")[1]) for id in query_results["ids"][0]
@@ -407,33 +383,19 @@ class TextualRAGEngine:
                         }
 
                         fused = self._rrf_fuse([bm25_ranking, dense_ranking])
-                        top_fused = fused[: pre_k]
+                        top_fused = fused[: self.top_k * 2]
 
-                        contexts = []
-                        for idx, fused_score in top_fused:
+                        for rank, (idx, fused_score) in enumerate(top_fused):
                             chunk_info = chunk_to_doc_mapping[idx]
-                            contexts.append(
-                                {
-                                    "chunk": all_chunks[idx],
-                                    "chunk_pdf_name": chunk_info["chunk_pdf_name"],
-                                    "pdf_page_number": chunk_info["pdf_page_number"],
-                                    "_base_score": fused_score,
-                                }
-                            )
-
-                        contexts = self._rerank_contexts(question, contexts)
-                        contexts = contexts[: self.top_k * 2]
-
-                        for rank, ctx in enumerate(contexts):
                             results.append(
                                 {
                                     "q_id": q_id,
                                     "question": question,
-                                    "chunk": ctx["chunk"],
-                                    "chunk_pdf_name": ctx["chunk_pdf_name"],
-                                    "pdf_page_number": ctx["pdf_page_number"],
+                                    "chunk": all_chunks[idx],
+                                    "chunk_pdf_name": chunk_info["chunk_pdf_name"],
+                                    "pdf_page_number": chunk_info["pdf_page_number"],
                                     "rank": rank + 1,
-                                    "score": ctx.get("_rerank_score", ctx.get("_base_score", 0.0)),
+                                    "score": fused_score,
                                 }
                             )
                     except Exception as e:
@@ -525,6 +487,7 @@ class TextualRAGEngine:
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.config.get("text_chunk_size", 500),
             chunk_overlap=self.config.get("text_chunk_overlap", 100),
+            language = Language.MARKDOWN
         )
 
         # Tables are rendered in markdown as HTML <table>...</table> blocks.
@@ -541,17 +504,63 @@ class TextualRAGEngine:
             for page_idx, page_text in enumerate(pages):
                 text = page_text or ""
 
-                # If the page contains an HTML table block, keep the whole page as a single chunk
+                # If the page contains HTML table blocks, split the page so that each <table>...</table> (together with its caption lines) forms
+                # an independent chunk, and the remaining non-table text is chunked with the standard splitter.
                 if html_table_pattern.search(text):
-                    chunk = text
-                    all_chunks.append(chunk)
-                    chunk_to_doc_mapping.append(
-                        {
-                            "chunk": chunk,
-                            "chunk_pdf_name": doc_id,
-                            "pdf_page_number": page_idx,
-                        }
-                    )
+                    last_pos = 0
+                    table_matches = list(html_table_pattern.finditer(text))
+
+                    for i, match in enumerate(table_matches):
+                        start = match.start()
+
+                        # Pure text before this table
+                        if start > last_pos:
+                            prefix = text[last_pos:start]
+                            if prefix.strip():
+                                for chunk in splitter.split_text(prefix):
+                                    all_chunks.append(chunk)
+                                    chunk_to_doc_mapping.append(
+                                        {
+                                            "chunk": chunk,
+                                            "chunk_pdf_name": doc_id,
+                                            "pdf_page_number": page_idx,
+                                        }
+                                    )
+
+                        # Table block itself (including its caption and any
+                        # immediately following lines up to the next table or
+                        # end of page).
+                        next_start = (
+                            table_matches[i + 1].start()
+                            if i + 1 < len(table_matches)
+                            else len(text)
+                        )
+                        table_block = text[start:next_start]
+                        if table_block.strip():
+                            all_chunks.append(table_block)
+                            chunk_to_doc_mapping.append(
+                                {
+                                    "chunk": table_block,
+                                    "chunk_pdf_name": doc_id,
+                                    "pdf_page_number": page_idx,
+                                }
+                            )
+
+                        last_pos = next_start
+
+                    # Trailing pure text after the last table
+                    if last_pos < len(text):
+                        suffix = text[last_pos:]
+                        if suffix.strip():
+                            for chunk in splitter.split_text(suffix):
+                                all_chunks.append(chunk)
+                                chunk_to_doc_mapping.append(
+                                    {
+                                        "chunk": chunk,
+                                        "chunk_pdf_name": doc_id,
+                                        "pdf_page_number": page_idx,
+                                    }
+                                )
                     continue
 
                 # If the page contains images (with optional captions), keep image path and
@@ -700,7 +709,7 @@ class TextualRAGEngine:
 
                 query_results = self._text_collection.query(
                     query_texts=[question],
-                    n_results=self.top_k,
+                    n_results=pre_k,
                 )
                 dense_indices = [
                     int(id.split("_")[1]) for id in query_results["ids"][0]

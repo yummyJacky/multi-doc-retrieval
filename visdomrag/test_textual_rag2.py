@@ -3,12 +3,20 @@ os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 import argparse
 from pathlib import Path
 from typing import Dict, List
+import logging
 
-from visdom import VisDoMRAG, TextualRAGEngine
 from dotenv import load_dotenv
+from visdom import VisDoMRAG
 
 load_dotenv()
-
+# Configure logging in the entry script so all VisDoMRAG loggers share it
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.FileHandler("test_textual_rag2.log"), logging.StreamHandler()],
+    force=True,
+)
+logger = logging.getLogger("VisDoMRAG")
 
 def build_visdom_for_pdf(pdf_path: List[str], args: argparse.Namespace) -> VisDoMRAG:
     """Construct a VisDoMRAG instance for a single-PDF textual test.
@@ -45,6 +53,7 @@ def build_visdom_for_pdf(pdf_path: List[str], args: argparse.Namespace) -> VisDo
         "qwen_vl_server_url": args.qwen_vl_server_url,
         "qwen_vl_model": args.qwen_vl_model,
         "qwen_vl_api_key": args.qwen_vl_api_key,
+        "text_use_rerank": args.text_use_rerank,
     }
 
     return VisDoMRAG(config)
@@ -65,31 +74,31 @@ def test_textual_retrieval(args: argparse.Namespace) -> None:
     )
     for pdf in pdf_path:
         if not os.path.exists(pdf):
-            print(f"[SKIP] PDF file not found: {pdf}")
+            logger.info(f"[SKIP] PDF file not found: {pdf}")
             return
 
     try:
         visdom = build_visdom_for_pdf(pdf_path, args)
     except Exception as e:
-        print(f"[ERROR] Failed to initialize VisDoMRAG: {e}")
+        logger.info(f"[ERROR] Failed to initialize VisDoMRAG: {e}")
         return
 
     query = args.query or "截至二零二四年每收入单位的温室气体排放总量是多少？"
-    print(f"[INFO] Running textual retrieval for query: {query}")
+    logger.info(f"[INFO] Running textual retrieval for query: {query}")
 
     try:
         contexts = visdom.retrieve_textual_contexts_for_question(query)
     except Exception as e:
-        print(f"[ERROR] Textual retrieval raised an exception: {e}")
+        logger.info(f"[ERROR] Textual retrieval raised an exception: {e}")
         return
 
-    print(f"[RESULT] Retrieved {len(contexts)} textual contexts")
+    logger.info(f"[RESULT] Retrieved {len(contexts)} textual contexts")
     for i, ctx in enumerate(contexts):
         chunk = ctx.get("chunk", "")
         doc_id = ctx.get("chunk_pdf_name")
         page_num = ctx.get("pdf_page_number")
         preview = chunk[:60].replace("\n", " ") + ("..." if len(chunk) > 60 else "")
-        print(f"  - #{i}: doc={doc_id}, page={page_num}, text_preview={preview}")
+        logger.info(f"  - #{i}: doc={doc_id}, page={page_num}, text_preview={preview}")
 
 def test_full_textual_pipeline_with_ocr_and_captions(args: argparse.Namespace) -> None:
     """Run a full textual pipeline: OCR + (optional) image captions + retrieval.
@@ -104,55 +113,55 @@ def test_full_textual_pipeline_with_ocr_and_captions(args: argparse.Namespace) -
 
     pdf_path = args.pdf_path
     if not pdf_path or not os.path.exists(pdf_path):
-        print(f"[SKIP] PDF file not found for full pipeline test: {pdf_path}")
+        logger.info(f"[SKIP] PDF file not found for full pipeline test: {pdf_path}")
         return
 
     if not args.qwen_vl_server_url:
-        print("[SKIP] QWEN_VL_SERVER_URL not set; skipping caption integration test")
+        logger.info("[SKIP] QWEN_VL_SERVER_URL not set; skipping caption integration test")
         return
 
     try:
         visdom = build_visdom_for_pdf(pdf_path, args)
     except Exception as e:
-        print(f"[ERROR] Failed to initialize VisDoMRAG for full pipeline: {e}")
+        logger.info(f"[ERROR] Failed to initialize VisDoMRAG for full pipeline: {e}")
         return
 
     query = args.query
-    print(f"[INFO] Running full textual pipeline for query: {query}")
+    logger.info(f"[INFO] Running full textual pipeline for query: {query}")
 
     try:
         contexts = visdom.retrieve_textual_contexts_for_question(query)
     except Exception as e:
-        print(f"[ERROR] Full textual pipeline retrieval raised an exception: {e}")
+        logger.info(f"[ERROR] Full textual pipeline retrieval raised an exception: {e}")
         return
 
-    print(f"[RESULT] Full pipeline retrieved {len(contexts)} textual contexts")
+    logger.info(f"[RESULT] Full pipeline retrieved {len(contexts)} textual contexts")
     for i, ctx in enumerate(contexts):
         chunk = ctx.get("chunk", "")
         doc_id = ctx.get("chunk_pdf_name")
         page_num = ctx.get("pdf_page_number")
         preview = chunk[:80].replace("\n", " ") + ("..." if len(chunk) > 80 else "")
-        print(f"  - #{i}: doc={doc_id}, page={page_num}, text_preview={preview}")
+        logger.info(f"  - #{i}: doc={doc_id}, page={page_num}, text_preview={preview}")
 
     # Optionally, check whether any retrieved chunk contains an image caption
     # marker to give a quick signal that Qwen-VL augmentation is flowing
     # through the pipeline. We don't assert on this to avoid flakiness.
     has_caption = any("caption:" in ctx.get("chunk", "") for ctx in contexts)
-    print(f"[INFO] Any 'caption:' marker present in retrieved chunks: {has_caption}")
+    logger.info(f"[INFO] Any 'caption:' marker present in retrieved chunks: {has_caption}")
 
     if not contexts:
-        print("[SKIP] No contexts were retrieved, skipping generation step.")
+        logger.info("[SKIP] No contexts were retrieved, skipping generation step.")
         return
 
-    print(f"\n[INFO] Generating textual response using LLM: {args.llm_model}...")
+    logger.info(f"\n[INFO] Generating textual response using LLM: {args.llm_model}...")
     try:
         response = visdom.generate_textual_response(query, contexts)
-        print("--- LLM Response ---")
-        print(response)
-        print("--- End LLM Response ---")
+        logger.info("--- LLM Response ---")
+        logger.info(response)
+        logger.info("--- End LLM Response ---")
         assert response and "Answer:" in response
     except Exception as e:
-        print(f"[ERROR] Textual response generation raised an exception: {e}")
+        logger.info(f"[ERROR] Textual response generation raised an exception: {e}")
         return
 
 def main(args: argparse.Namespace) -> None:
@@ -160,14 +169,14 @@ def main(args: argparse.Namespace) -> None:
     run_all = not (args.run_integration_test or args.run_full_pipeline_test)
 
     if run_all or args.run_integration_test:
-        print("\n--- Running Basic Integration Test ---")
+        logger.info("\n--- Running Basic Integration Test ---")
         test_textual_retrieval(args)
-        print("--- Basic Integration Test Finished ---")
+        logger.info("--- Basic Integration Test Finished ---")
 
     if run_all or args.run_full_pipeline_test:
-        print("\n--- Running Full Pipeline Test (OCR + Captions) ---")
+        logger.info("\n--- Running Full Pipeline Test (OCR + Captions) ---")
         test_full_textual_pipeline_with_ocr_and_captions(args)
-        print("--- Full Pipeline Test Finished ---")
+        logger.info("--- Full Pipeline Test Finished ---")
 
 
 if __name__ == "__main__":
@@ -177,8 +186,8 @@ if __name__ == "__main__":
         type=List[str],
         default=[
             "/home/zechuan/m3docrag/contents/2024_Tencent_ESG.pdf",
-            "/home/zechuan/m3docrag/contents/2024_sanqi_ESG.pdf",
-            "/home/zechuan/m3docrag/contents/2024_architecture_ESG.pdf",
+            # "/home/zechuan/m3docrag/contents/2024_sanqi_ESG.pdf",
+            # "/home/zechuan/m3docrag/contents/2024_architecture_ESG.pdf",
         ],
         help="Path to the PDF file for integration tests.",
     )
@@ -193,8 +202,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--query",
         type=str,
-        default="三家公司的2024年男性员工数量分别是多少？", #"在反舞弊举报及调查中，包含哪些操作？",
+        default="公司的2024年男性员工数量分别是多少？", #"在反舞弊举报及调查中，包含哪些操作？",
         help="Query for retrieval tests.",
+    )
+    parser.add_argument(
+        "--text_use_rerank",
+        action="store_true",
+        help="Enable CrossEncoder-based reranking for textual retrieval.",
     )
     parser.add_argument(
         "--qwen-vl-server-url",

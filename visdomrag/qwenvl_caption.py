@@ -164,6 +164,125 @@ class QwenVLCaptioner:
             )
             return ""
 
+    def caption_table_from_page_image(self, md_path: str, table_index: int) -> str:
+        """Generate a table-focused caption from a full-page image inferred from a
+        DotsOCR markdown path, for a specific table index on that page.
+
+        This is used when the markdown for a page contains one or more HTML table
+        blocks ("<table>...</table>"). We infer the page-level image path from the
+        markdown filename (e.g. "XXX_page_10.md" -> "XXX_page_10.png") and ask
+        Qwen-VL to describe the key information in the *N-th* table on that page,
+        where N is given by ``table_index`` (1-based).
+        """
+        if not self._ensure_server_available():
+            return ""
+
+        if not md_path:
+            return ""
+
+        dir_name = os.path.dirname(md_path)
+        base_name = os.path.basename(md_path)
+
+        # Support both XXX_page_10.md and XXX_page_10_nohf.md
+        m = re.match(r"(.+)_page_(\d+)(?:_nohf)?\.md$", base_name)
+        if not m:
+            self.logger.debug(
+                "Could not infer page image path from markdown path: %s", md_path
+            )
+            return ""
+
+        pdf_stem, page_idx = m.group(1), m.group(2)
+        image_name = f"{pdf_stem}_page_{page_idx}.jpg"
+        image_path = os.path.join(dir_name, image_name)
+
+        if not os.path.exists(image_path):
+            self.logger.warning(
+                "Page image for table caption not found: %s", image_path
+            )
+            return ""
+
+        url = self._chat_completions_url()
+        if url is None:
+            return ""
+
+        prompt = (
+            f"这是一页 PDF 的整体截图，其中包含一个或多个表格。请重点关注第 {table_index} 个表格，"
+            "并用中文精准凝练地概括该表格的核心内容。如果无法清晰看清表格内容，请说明看不清，而不要编造具体信息。"
+        )
+
+        try:
+            with open(image_path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode("utf-8")
+        except Exception as e:
+            self.logger.error(
+                "Error reading page image for table caption %s: %s", image_path, str(e)
+            )
+            return ""
+
+        data_url = f"data:image/png;base64,{b64}"
+
+        payload: Dict[str, Any] = {
+            "model": self.model_name,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ],
+            "max_tokens": 512,
+            "temperature": 0,
+        }
+
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                data=json.dumps(payload),
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            data = response.json()
+        except Exception as e:
+            self.logger.error(
+                "Error calling Qwen-VL vLLM server for table caption %s: %s",
+                image_path,
+                str(e),
+            )
+            return ""
+
+        try:
+            choices = data.get("choices") or []
+            if not choices:
+                return ""
+            message = choices[0].get("message", {})
+            content = message.get("content")
+
+            if isinstance(content, str):
+                generated = content
+            else:
+                parts = []
+                for block in content or []:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        parts.append(block.get("text", ""))
+                generated = "".join(parts)
+
+            caption = (generated or "").strip().strip("'\"")
+            return caption
+        except Exception as e:
+            self.logger.error(
+                "Error parsing Qwen-VL response for table caption %s: %s",
+                image_path,
+                str(e),
+            )
+            return ""
+
     def augment_markdown(self, md_path: str) -> str:
         """Append Qwen-VL captions after images in a markdown file.
 
@@ -187,10 +306,11 @@ class QwenVLCaptioner:
             )
             return ""
 
-        pattern = r"!\[]\(([^)]+)\)"
+        # First, augment image references with captions as before.
+        image_pattern = r"!\[]\(([^)]+)\)"
         dir_name = os.path.dirname(md_path)
 
-        def _replace(match: re.Match) -> str:
+        def _replace_image(match: re.Match) -> str:
             rel_path = match.group(1)
             full_path = os.path.join(dir_name, rel_path)
             if not os.path.exists(full_path):
@@ -204,19 +324,45 @@ class QwenVLCaptioner:
             return f"{match.group(0)}\ncaption: {caption}"
 
         try:
-            new_md_text = re.sub(pattern, _replace, md_text)
+            processed_md_text = re.sub(image_pattern, _replace_image, md_text)
         except Exception as e:
             self.logger.error(
-                "Error applying caption regex to markdown %s: %s", md_path, str(e)
+                "Error applying image caption regex to markdown %s: %s", md_path, str(e)
             )
-            return md_text
+            processed_md_text = md_text
 
-        if new_md_text != md_text:
+        # Then, if there are HTML table blocks, generate a table-focused caption from the full-page image and append it after each table. 
+        # Each table will get its own caption by calling Qwen-VL separately with a table index.
+        table_pattern = re.compile(r"<table\b.*?</table>", re.IGNORECASE | re.DOTALL)
+
+        if table_pattern.search(processed_md_text):
+            table_counter = {"idx": 0}
+
+            def _add_table_caption(match: re.Match) -> str:
+                table_counter["idx"] += 1
+                print("find a table,add table caption...")
+                idx = table_counter["idx"]
+                table_caption = self.caption_table_from_page_image(md_path, idx)
+                table_html = match.group(0)
+                if not table_caption:
+                    return table_html
+                return f"{table_html}\ncaption: {table_caption}"
+
+            try:
+                processed_md_text = table_pattern.sub(_add_table_caption, processed_md_text)
+            except Exception as e:
+                self.logger.error(
+                    "Error applying table caption regex to markdown %s: %s",
+                    md_path,
+                    str(e),
+                )
+
+        if processed_md_text != md_text:
             try:
                 with open(md_path, "w", encoding="utf-8") as f:
-                    f.write(new_md_text)
+                    f.write(processed_md_text)
             except Exception as e:
                 self.logger.error(
                     "Error writing augmented markdown to %s: %s", md_path, str(e)
                 )
-        return new_md_text
+        return processed_md_text
