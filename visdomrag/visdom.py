@@ -25,6 +25,13 @@ from textual_rag import TextualRAGEngine
 from ocr_extractor import OCRExtractor
 from qwenvl_caption import QwenVLCaptioner
 
+# Configure logging in the entry script so all VisDoMRAG loggers share it
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.FileHandler("visdmrag.log"), logging.StreamHandler()],
+    force=True,
+)
 # Configure logging (actual handlers are set up by entry scripts)
 logger = logging.getLogger("VisDoMRAG")
 

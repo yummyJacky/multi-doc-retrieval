@@ -112,9 +112,10 @@ def test_full_textual_pipeline_with_ocr_and_captions(args: argparse.Namespace) -
     """
 
     pdf_path = args.pdf_path
-    if not pdf_path or not os.path.exists(pdf_path):
-        logger.info(f"[SKIP] PDF file not found for full pipeline test: {pdf_path}")
-        return
+    for pdf in pdf_path:
+        if not pdf or not os.path.exists(pdf):
+            logger.info(f"[SKIP] PDF file not found for full pipeline test: {pdf}")
+            return
 
     if not args.qwen_vl_server_url:
         logger.info("[SKIP] QWEN_VL_SERVER_URL not set; skipping caption integration test")
@@ -186,8 +187,8 @@ if __name__ == "__main__":
         type=List[str],
         default=[
             "/home/zechuan/m3docrag/contents/2024_Tencent_ESG.pdf",
-            # "/home/zechuan/m3docrag/contents/2024_sanqi_ESG.pdf",
-            # "/home/zechuan/m3docrag/contents/2024_architecture_ESG.pdf",
+            "/home/zechuan/m3docrag/contents/2024_sanqi_ESG.pdf",
+            "/home/zechuan/m3docrag/contents/2024_architecture_ESG.pdf",
         ],
         help="Path to the PDF file for integration tests.",
     )
@@ -202,7 +203,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--query",
         type=str,
-        default="公司的2024年男性员工数量分别是多少？", #"在反舞弊举报及调查中，包含哪些操作？",
+        default="公司的2024年男性员工数量分别是多少？",#"三家公司二零二四年男性员工数量分别是多少？", #"在反舞弊举报及调查中，包含哪些操作？",
         help="Query for retrieval tests.",
     )
     parser.add_argument(
