@@ -146,7 +146,6 @@ dataset
 multimodalqa_screenshots
 *.json
 *.pdf
-*.jsonl*
 contents/
 setup_BCOS_README.md
 deepseek_ocr_app/

@@ -166,6 +166,31 @@ class TextualRAGEngine:
         # Text retrieval resources
         self.text_retrieval_file = f"{self.data_dir}/retrieval/retrieval_{self.text_retriever}.csv"
 
+        # Common text splitters used by interactive retrieval for all retrievers
+        self.separators = [
+            "\n\n",                          # 段落
+            "\n",                            # 换行
+            "。", "！", "？",          # 中文标点
+            ".\n", ". ", "! ", "? ",  # 英文标点+空格（避免切断小数点）
+            " ",                             # 空格
+            ""                               # 字符级
+        ]
+        self.splitter = RecursiveCharacterTextSplitter(
+            chunk_size=self.config.get("text_chunk_size", 500),
+            chunk_overlap=self.config.get("text_chunk_overlap", 100),
+            separators=self.separators,
+            keep_separator=True   # 保持分隔符
+        )
+
+        self.md_header_splitter = MarkdownHeaderTextSplitter(
+            headers_to_split_on=[
+                ("#", "Header 1"),
+                ("##", "Header 2"),
+                ("###", "Header 3"),
+            ],
+            strip_headers=False,
+        )
+
         if self.text_retriever == "bm25":
             # No model needed for BM25
             print("Using BM25 for text retrieval")
@@ -179,9 +204,8 @@ class TextualRAGEngine:
                 "mpnet": "sentence-transformers/all-mpnet-base-v2",
                 "bge": "BAAI/bge-large-zh-v1.5",
                 # Hybrid uses MiniLM as the dense encoder
-                "hybrid": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+                "hybrid": "BAAI/bge-large-zh-v1.5",#"sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
             }
-
             # Load sentence transformer model
             self.text_model_name = model_map[self.text_retriever]
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -670,6 +694,18 @@ class TextualRAGEngine:
         
         return text.strip()
 
+    def split_markdown_segment(self, segment: str):
+            if not segment or not segment.strip():
+                return []
+            try:
+                docs = self.md_header_splitter.split_text(segment)
+                if not docs:
+                    return self.splitter.split_text(segment)
+                split_docs = self.splitter.split_documents(docs)
+                return [d.page_content for d in split_docs]
+            except Exception:
+                return self.splitter.split_text(segment)
+
     def _extract_table_caption(self, text_after_table: str):
         if not text_after_table:
             return "", text_after_table or ""
@@ -693,7 +729,6 @@ class TextualRAGEngine:
         all_chunks,
         chunk_to_doc_mapping,
         html_table_pattern,
-        split_markdown_segment,
     ):
         last_pos = 0
         table_matches = list(html_table_pattern.finditer(text))
@@ -725,7 +760,7 @@ class TextualRAGEngine:
 
             if parts:
                 region_text = "\n".join(seg.strip() for seg in parts)
-                region_chunks = split_markdown_segment(region_text)
+                region_chunks = self.split_markdown_segment(region_text)
 
                 if caption:
                     caption_chunks = [
@@ -764,7 +799,6 @@ class TextualRAGEngine:
         all_chunks,
         chunk_to_doc_mapping,
         image_block_pattern,
-        split_markdown_segment,
     ):
         last_idx = 0
         text_segments = []
@@ -795,7 +829,7 @@ class TextualRAGEngine:
         # in the same chunk if the page is not too long.
         if text_segments:
             merged_text = "\n".join(seg.strip() for seg in text_segments)
-            for chunk in split_markdown_segment(merged_text):
+            for chunk in self.split_markdown_segment(merged_text):
                 all_chunks.append(chunk)
                 chunk_to_doc_mapping.append(
                     {
@@ -823,9 +857,8 @@ class TextualRAGEngine:
         text,
         all_chunks,
         chunk_to_doc_mapping,
-        split_markdown_segment,
     ):
-        for chunk in split_markdown_segment(text):
+        for chunk in self.split_markdown_segment(text):
             all_chunks.append(chunk)
             chunk_to_doc_mapping.append(
                 {
@@ -853,35 +886,6 @@ class TextualRAGEngine:
             " ",                             # 空格
             ""                               # 字符级
         ]
-        
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=self.config.get("text_chunk_size", 500),
-            chunk_overlap=self.config.get("text_chunk_overlap", 100),
-            separators=self.separators,
-            keep_separator=True   # 保持分隔符
-        )
-        
-
-        md_header_splitter = MarkdownHeaderTextSplitter(
-            headers_to_split_on=[
-                ("#", "Header 1"),
-                ("##", "Header 2"),
-                ("###", "Header 3"),
-            ],
-            strip_headers=False,
-        )
-
-        def _split_markdown_segment(segment: str):
-            if not segment or not segment.strip():
-                return []
-            try:
-                docs = md_header_splitter.split_text(segment)
-                if not docs:
-                    return splitter.split_text(segment)
-                split_docs = splitter.split_documents(docs)
-                return [d.page_content for d in split_docs]
-            except Exception:
-                return splitter.split_text(segment)
 
         # Tables are rendered in markdown as HTML <table>...</table> blocks.
         # A single page may contain multiple tables, but any presence of a
@@ -905,7 +909,6 @@ class TextualRAGEngine:
                         all_chunks,
                         chunk_to_doc_mapping,
                         html_table_pattern,
-                        _split_markdown_segment,
                     )
                     continue
 
@@ -919,7 +922,6 @@ class TextualRAGEngine:
                         all_chunks,
                         chunk_to_doc_mapping,
                         image_block_pattern,
-                        _split_markdown_segment,
                     )
                 else:
                     self._handle_plain_text_page(
@@ -928,7 +930,6 @@ class TextualRAGEngine:
                         text,
                         all_chunks,
                         chunk_to_doc_mapping,
-                        _split_markdown_segment,
                     )
 
         self._text_chunks = all_chunks
@@ -1097,28 +1098,28 @@ class TextualRAGEngine:
             elif self.llm_model == "doubao":
                 # Non-streaming:
                 print("----- standard request -----")
-                # completion = self.llm.chat.completions.create(
-                #     model="doubao-1-5-lite-32k-250115",
-                #     messages=[
-                #         {"role": "user", "content": prompt_template},
-                #     ],
-                # )
-                # return completion.choices[0].message.content
-                response = self.llm.responses.create(
-                    model="doubao-seed-1-6-flash-250828",
-                    input=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "input_text",
-                                    "text": prompt_template,
-                                }
-                            ],
-                        }
+                completion = self.llm.chat.completions.create(
+                    model="doubao-1-5-lite-32k-250115",
+                    messages=[
+                        {"role": "user", "content": prompt_template},
                     ],
                 )
-                return response.output[1].content[0].text
+                return completion.choices[0].message.content
+                # response = self.llm.responses.create(
+                #     model="doubao-seed-1-6-flash-250828",
+                #     input=[
+                #         {
+                #             "role": "user",
+                #             "content": [
+                #                 {
+                #                     "type": "input_text",
+                #                     "text": prompt_template,
+                #                 }
+                #             ],
+                #         }
+                #     ],
+                # )
+                # return response.output[1].content[0].text
 
             elif self.llm_model == "qwen":
                 messages = [
