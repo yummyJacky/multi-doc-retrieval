@@ -34,7 +34,7 @@ logger = logging.getLogger("VisDoMRAG")
 CACHE_DIR: Path = ESG_DIR / "eval_rag_deepeval"
 CACHE_FILE: Path = CACHE_DIR / "rag_answer_cache.jsonl"
 os.makedirs(CACHE_DIR, exist_ok=True)
-DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-VL-7B-Instruct"
+DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
 MODEL_NAME = DEFAULT_MODEL_NAME
 
 class ESGMdParentDoubao:
@@ -179,8 +179,13 @@ def _build_rag_prompt(question: str, contexts: List[str]) -> str:
     return prompt
 
 
-def _call_qwen_chat(prompt: str, max_tokens: int = 512, temperature: float = 0.0) -> str:
-    """调用本地 Qwen2.5-VL HTTP 服务的纯文本 chat 接口。
+def _call_qwen_chat(
+    prompt: str,
+    max_tokens: int = 8192,
+    temperature: float = 0.0,
+    json_mode: bool = False,
+) -> str:
+    """调用本地 Qwen2.5-7B HTTP 服务的纯文本 chat 接口。
 
     复用 generate_esg_qa.py 中的 `_chat_completions_url` / MODEL_NAME / QWEN_VL_API_KEY
     配置，只发送文本消息，不附带图片，从而作为评测用的 LLM。"""
@@ -205,6 +210,10 @@ def _call_qwen_chat(prompt: str, max_tokens: int = 512, temperature: float = 0.0
         "temperature": temperature,
     }
 
+    # 对于 DeepEval 评估调用，强制使用 JSON 输出模式，以减少无效 JSON 的概率
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+
     headers = {"Content-Type": "application/json"}
     if QWEN_VL_API_KEY:
         headers["Authorization"] = f"Bearer {QWEN_VL_API_KEY}"
@@ -223,7 +232,7 @@ def _call_qwen_chat(prompt: str, max_tokens: int = 512, temperature: float = 0.0
         return ""
     message = choices[0].get("message", {})
     content = message.get("content")
-
+    # logger.info(f"DEBUG - Response: {content}")
     # vLLM OpenAI server 可能返回字符串或 block 列表
     if isinstance(content, str):
         generated = content
@@ -245,11 +254,12 @@ class QwenLocalEvalModel(DeepEvalBaseLLM):
         return self
 
     def generate(self, prompt: str, *args, **kwargs) -> str:  # type: ignore[override]
-        return _call_qwen_chat(prompt)
+        # DeepEval 在评估指标时会要求严格的 JSON 输出，这里开启 json_mode
+        return _call_qwen_chat(prompt, json_mode=True)
 
     async def a_generate(self, prompt: str, *args, **kwargs) -> str:  # type: ignore[override]
         # 使用线程池异步执行阻塞的 HTTP 请求，以便真正并发多个评估调用
-        return await asyncio.to_thread(_call_qwen_chat, prompt)
+        return await asyncio.to_thread(_call_qwen_chat, prompt, json_mode=True)
 
     def get_model_name(self, *args, **kwargs) -> str:  # type: ignore[override]
         # 使用 DeepEvalBaseLLM 默认的 name，如果缺失则回退到我们配置的 MODEL_NAME
@@ -446,11 +456,11 @@ def main():
         threshold=0.5,
         include_reason=True,
     )
-    faithfulness = FaithfulnessMetric(
-        model=eval_model,
-        threshold=0.5,
-        include_reason=True,
-    )
+    # faithfulness = FaithfulnessMetric(
+    #     model=eval_model,
+    #     threshold=0.5,
+    #     include_reason=True,
+    # )
     contextual_relevancy = ContextualRelevancyMetric(
         model=eval_model,
         threshold=0.5,
@@ -466,12 +476,91 @@ def main():
 
     result = evaluate(
         test_cases=test_cases,
-        metrics=[answer_relevancy, faithfulness, contextual_relevancy],
+        metrics=[answer_relevancy, contextual_relevancy],
         async_config=async_config,
     )
 
     print("===== DeepEval ESG RAG Evaluation Result =====")
     print(result)
+
+    # 将评估结果保存到文件，便于后续分析
+    summary_path = CACHE_DIR / "deepeval_summary.txt"
+    json_path = CACHE_DIR / "deepeval_results.jsonl"
+
+    try:
+        with summary_path.open("w", encoding="utf-8") as f:
+            f.write("===== DeepEval ESG RAG Evaluation Summary =====\n")
+            f.write(f"Total test cases: {len(result.test_results)}\n\n")
+
+            for idx, test_result in enumerate(result.test_results):
+                tc = getattr(test_result, "test_case", None)
+                tc_input = getattr(tc, "input", None) if tc is not None else None
+                f.write(f"--- Test Case #{idx}\n")
+                if tc_input is not None:
+                    f.write(f"Input: {tc_input}\n")
+                for m in test_result.metrics_data:
+                    f.write(
+                        f"  - Metric: {m.name}, score={m.score}, "
+                        f"threshold={m.threshold}, success={m.success}\n"
+                    )
+                    if m.reason:
+                        f.write(f"    reason: {m.reason}\n")
+                f.write("\n")
+
+        print(f"Saved evaluation summary to: {summary_path}")
+    except Exception as e:
+        logger.error("Failed to write evaluation summary to %s: %s", summary_path, e)
+
+    # 逐条测试结果写入 JSONL，包含每个 metric 的得分与原因
+    try:
+        with json_path.open("w", encoding="utf-8") as f:
+            for test_result in result.test_results:
+                tc = getattr(test_result, "test_case", None)
+
+                # 动态获取 test_case 的所有字段，避免硬编码
+                if tc is None:
+                    tc_data = None
+                elif hasattr(tc, "model_dump"):
+                    # pydantic v2
+                    tc_data = tc.model_dump()
+                elif hasattr(tc, "dict"):
+                    # pydantic v1
+                    tc_data = tc.dict()
+                else:
+                    tc_data = {
+                        k: v
+                        for k, v in vars(tc).items()
+                        if not k.startswith("_")
+                    }
+
+                # 顶层记录中显式包含用于生成回答的检索上下文（retrieval_context）
+                retrieval_context = None
+                if isinstance(tc_data, dict):
+                    retrieval_context = tc_data.get("retrieval_context")
+
+                record = {
+                    "test_case": tc_data,
+                    "retrieval_context": retrieval_context,
+                    "metrics": [],
+                }
+
+                for m in test_result.metrics_data:
+                    record["metrics"].append(
+                        {
+                            "name": m.name,
+                            "score": m.score,
+                            "threshold": m.threshold,
+                            "success": m.success,
+                            "reason": m.reason,
+                            "error": m.error,
+                        }
+                    )
+
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        print(f"Saved per-test evaluation results to: {json_path}")
+    except Exception as e:
+        logger.error("Failed to write detailed evaluation results to %s: %s", json_path, e)
 
 
 if __name__ == "__main__":

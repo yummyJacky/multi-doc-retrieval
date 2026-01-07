@@ -721,6 +721,92 @@ class TextualRAGEngine:
         remaining = (text_after_table[:start] + text_after_table[end:]).lstrip("\n")
         return caption, remaining
 
+    # def _chunk_html_table(
+    #     self,
+    #     table_html: str,
+    #     caption: str,
+    #     doc_id: str,
+    #     page_idx: int,
+    #     all_chunks,
+    #     chunk_to_doc_mapping,
+    # ):
+    #     """Split a single HTML <table> into multiple row-wise text chunks.
+
+    #     Each chunk contains the column header line plus several data rows. A
+    #     caption (if provided) is prepended to every chunk so that they all
+    #     carry the table semantics, similar to the Textract example where the
+    #     sentence before the table is repeated for each chunk.
+    #     """
+
+    #     if not table_html:
+    #         return
+
+    #     try:
+    #         from io import StringIO
+    #         dfs = pd.read_html(StringIO(table_html))
+    #     except Exception as e:
+    #         logger.warning("Failed to parse HTML table on %s page %s: %s", doc_id, page_idx, e)
+    #         return
+
+    #     if not dfs:
+    #         return
+
+    #     df = dfs[0]
+    #     # Drop rows that are completely empty
+    #     df = df.dropna(how="all")
+    #     if df.empty:
+    #         return
+
+    #     # Normalize to string so that we can safely join cells and headers
+    #     df = df.astype(str).fillna("")
+    #     header_line = " | ".join([str(c) for c in df.columns])
+    #     data_rows = df.values.tolist()
+
+    #     # Use the same scale as text chunks by default, but allow override
+    #     max_words = int(self.config.get("table_chunk_word_limit", self.config.get("text_chunk_size", 500)))
+    #     if max_words <= 0:
+    #         max_words = 500
+
+    #     current_rows = []
+    #     current_words = 0
+
+    #     def _flush_table_chunk():
+    #         nonlocal current_rows, current_words
+    #         if not current_rows:
+    #             return
+    #         body = "\n".join(current_rows)
+    #         if caption:
+    #             chunk_text = f"{caption}\n\n{header_line}\n{body}"
+    #         else:
+    #             chunk_text = f"{header_line}\n{body}"
+    #         all_chunks.append(chunk_text)
+    #         chunk_to_doc_mapping.append(
+    #             {
+    #                 "chunk": chunk_text,
+    #                 "chunk_pdf_name": doc_id,
+    #                 "pdf_page_number": page_idx,
+    #             }
+    #         )
+    #         current_rows = []
+    #         current_words = 0
+
+    #     for row in data_rows:
+    #         row_line = " | ".join(cell.strip() for cell in row if str(cell).strip())
+    #         if not row_line:
+    #             continue
+    #         row_words = len(row_line.split())
+
+    #         # If adding this row would exceed the word budget and we already
+    #         # have some rows collected, flush the current chunk first.
+    #         if current_rows and current_words + row_words > max_words:
+    #             _flush_table_chunk()
+
+    #         current_rows.append(row_line)
+    #         current_words += row_words
+
+    #     # Flush remaining rows
+    #     _flush_table_chunk()
+
     def _handle_table_page(
         self,
         doc_id,
@@ -735,6 +821,8 @@ class TextualRAGEngine:
 
         for i, match in enumerate(table_matches):
             start, end = match.span()
+
+            # table_html = match.group(0)
 
             parts = []
 
@@ -787,6 +875,18 @@ class TextualRAGEngine:
                             "pdf_page_number": page_idx,
                         }
                     )
+
+            # Finally, split the table itself into row-wise chunks so that we
+            # can retrieve parts of large tables. The caption (if any) is
+            # prepended to every table chunk.
+            # self._chunk_html_table(
+            #     table_html,
+            #     caption,
+            #     doc_id,
+            #     page_idx,
+            #     all_chunks,
+            #     chunk_to_doc_mapping,
+            # )
 
             # Next table can only see text after this one
             last_pos = next_start

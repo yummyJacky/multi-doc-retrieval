@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import argparse
 import csv
 import re
 from pathlib import Path
 
 
-def analyze_esg_pages() -> Path:
+def analyze_esg_pages(pages_dir: Path) -> Path:
     """Scan ESG Markdown pages and summarize which pages contain tables and images.
 
     - Looks for files under `results/dots_ocr/2024_Tencent_ESG` whose names end with digits + `.md`.
@@ -13,9 +14,6 @@ def analyze_esg_pages() -> Path:
     - Marks `has_image` if a Markdown image like `![...](...png)` appears.
     - Writes a CSV summary file next to the pages directory.
     """
-
-    base_dir = Path(__file__).resolve().parent
-    pages_dir = base_dir / "results" / "dots_ocr" / "2024_Tencent_ESG"
 
     if not pages_dir.is_dir():
         raise FileNotFoundError(f"Pages directory does not exist: {pages_dir}")
@@ -49,7 +47,8 @@ def analyze_esg_pages() -> Path:
         )
 
     # Write summary CSV in the same directory as the pages
-    output_path = pages_dir / "2024_Tencent_ESG_page_table_image_summary.csv"
+    dir_name = pages_dir.name
+    output_path = pages_dir / f"{dir_name}_page_table_image_summary.csv"
     with output_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
@@ -62,5 +61,15 @@ def analyze_esg_pages() -> Path:
 
 
 if __name__ == "__main__":  # pragma: no cover
-    summary_path = analyze_esg_pages()
+    parser = argparse.ArgumentParser(
+        description="Scan ESG Markdown pages and summarize tables and images."
+    )
+    parser.add_argument(
+        "--pages_dir",
+        type=str,
+        help="Directory containing ESG Markdown pages (e.g. results/dots_ocr/2024_Tencent_ESG)",
+    )
+    args = parser.parse_args()
+
+    summary_path = analyze_esg_pages(Path(args.pages_dir))
     print(f"Summary written to: {summary_path}")

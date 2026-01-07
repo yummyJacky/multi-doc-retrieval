@@ -15,11 +15,6 @@ from tqdm.auto import tqdm
 
 
 BASE_DIR = Path(__file__).resolve().parent
-ESG_DIR = BASE_DIR / "results" / "dots_ocr" / "2024_Tencent_ESG"
-CSV_PATH = ESG_DIR / "2024_Tencent_ESG_page_table_image_summary.csv"
-OUTPUT_JSONL = ESG_DIR / "2024_Tencent_ESG_table_qa_qwen2_5vl.jsonl"
-OUTPUT_IMAGE_JSONL = ESG_DIR / "2024_Tencent_ESG_image_qa_qwen2_5vl.jsonl"
-OUTPUT_TEXT_JSONL = ESG_DIR / "2024_Tencent_ESG_text_qa_qwen2_5vl.jsonl"
 
 logger = logging.getLogger("VisDoMRAG")
 
@@ -164,7 +159,7 @@ def find_page_images(page_number: str, image_dir: Path) -> List[Path]:
     return sorted(results)
 
 
-def build_generation_prompt() -> str:
+def build_table_generation_prompt() -> str:
     """构造给 Qwen2.5-VL 的中文指令，让模型基于表格图片生成 QA 对。"""
 
     prompt = (
@@ -176,6 +171,20 @@ def build_generation_prompt() -> str:
         "2. 尽量覆盖表格中的不同维度，例如年份变化、指标类别、数值对比、占比等。\n"
         "3. 每个问题都要清晰具体，答案要简洁准确，直接给出表格中的结论或数据。\n"
         "4. 输出格式必须是 JSON 数组，每个元素形如：{\"question\": \"问题\", \"answer\": \"答案\"}。\n"
+        "5. 只输出 JSON，不要输出任何额外说明或文字。"
+    )
+    return prompt
+
+
+def build_image_generation_prompt() -> str:
+    prompt = (
+        "你是一名专业的 ESG 报告分析助手。现在给你一张 ESG 报告中的图片以及它在报告中的文字说明（caption）。"
+        "请结合图片内容和文字说明，只根据其中包含的信息设计有代表性的中文问答对。\n\n"
+        "要求：\n"
+        "1. 问题和答案必须严格基于图片和对应 caption 中的信息，不要加入常识推理或主观评价。\n"
+        "2. 尽量覆盖图片所表达的不同要点，例如图示结构、趋势、对比关系或关键结论等。\n"
+        "3. 每个问题要清晰具体，答案要简洁准确，直接给出图片或 caption 中能找到的结论或数据。\n"
+        "4. 输出格式必须是 JSON 数组，每个元素形如:{\"question\": \"问题\", \"answer\": \"答案\"}。\n"
         "5. 只输出 JSON，不要输出任何额外说明或文字。"
     )
     return prompt
@@ -447,7 +456,7 @@ def extract_captioned_images_from_md(md_path: Path) -> List[tuple[Path, str]]:
     return results
 
 
-def generate_table_qa(output_path: Path | None = None) -> Path:
+def generate_table_qa(esg_dir: Path, csv_path: Path | None = None, output_path: Path | None = None) -> Path:
     """主流程：
 
     1. 读取 CSV 中标记为 has_table=1 的页；
@@ -456,14 +465,19 @@ def generate_table_qa(output_path: Path | None = None) -> Path:
     4. 将 QA 以 JSONL 格式写入 OUTPUT_JSONL。
     """
 
-    if not ESG_DIR.is_dir():
-        raise FileNotFoundError(f"ESG image directory not found: {ESG_DIR}")
+    if not esg_dir.is_dir():
+        raise FileNotFoundError(f"ESG image directory not found: {esg_dir}")
 
-    table_pages = load_table_pages(CSV_PATH)
+    dir_name = esg_dir.name
+
+    if csv_path is None:
+        csv_path = esg_dir / f"{dir_name}_page_table_image_summary.csv"
+
+    table_pages = load_table_pages(csv_path)
     if not table_pages:
-        raise RuntimeError(f"No table pages found in CSV: {CSV_PATH}")
+        raise RuntimeError(f"No table pages found in CSV: {csv_path}")
 
-    print(f"Loaded {len(table_pages)} table pages from {CSV_PATH}")
+    print(f"Loaded {len(table_pages)} table pages from {csv_path}")
 
     # 检查服务端配置
     if _chat_completions_url() is None:
@@ -471,20 +485,20 @@ def generate_table_qa(output_path: Path | None = None) -> Path:
             "QWEN_VL_SERVER_URL is not set; please configure the Qwen-VL HTTP server first."
         )
 
-    prompt = build_generation_prompt()
+    prompt = build_table_generation_prompt()
 
     # 输出 JSONL：一行一个 QA 样本
     if output_path is None:
-        output_path = OUTPUT_JSONL
+        output_path = esg_dir / f"{dir_name}_table_qa_qwen2_5vl.jsonl"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with output_path.open("w", encoding="utf-8") as fout:
         for page in tqdm(table_pages, desc="Generating QA for table pages"):
-            images = find_page_images(page.page_number, ESG_DIR)
+            images = find_page_images(page.page_number, esg_dir)
             if not images:
                 print(
                     f"[WARN] No images found for page {page.page_number} "
-                    f"(filename={page.filename}) in {ESG_DIR}"
+                    f"(filename={page.filename}) in {esg_dir}"
                 )
                 continue
 
@@ -501,10 +515,10 @@ def generate_table_qa(output_path: Path | None = None) -> Path:
 
                 for idx, qa in enumerate(qa_items):
                     record = {
-                        "doc": "2024_Tencent_ESG",
+                        "doc": dir_name,
                         "page_number": page.page_number,
                         "page_filename": page.filename,
-                        "image_path": str(img_path.relative_to(ESG_DIR)),
+                        "image_path": str(img_path.relative_to(esg_dir)),
                         "qa_index": idx,
                         "question": qa["question"],
                         "answer": qa["answer"],
@@ -516,32 +530,37 @@ def generate_table_qa(output_path: Path | None = None) -> Path:
     return output_path
 
 
-def generate_image_qa(output_path: Path | None = None) -> Path:
+def generate_image_qa(esg_dir: Path, csv_path: Path | None = None, output_path: Path | None = None) -> Path:
     """基于带 caption 的图片生成 QA，对应“图片模式”。"""
 
-    if not ESG_DIR.is_dir():
-        raise FileNotFoundError(f"ESG image directory not found: {ESG_DIR}")
+    if not esg_dir.is_dir():
+        raise FileNotFoundError(f"ESG image directory not found: {esg_dir}")
 
-    image_pages = load_image_pages(CSV_PATH)
+    dir_name = esg_dir.name
+
+    if csv_path is None:
+        csv_path = esg_dir / f"{dir_name}_page_table_image_summary.csv"
+
+    image_pages = load_image_pages(csv_path)
     if not image_pages:
-        raise RuntimeError(f"No image pages found in CSV: {CSV_PATH}")
+        raise RuntimeError(f"No image pages found in CSV: {csv_path}")
 
-    print(f"Loaded {len(image_pages)} image pages from {CSV_PATH}")
+    print(f"Loaded {len(image_pages)} image pages from {csv_path}")
 
     if _chat_completions_url() is None:
         raise RuntimeError(
             "QWEN_VL_SERVER_URL is not set; please configure the Qwen-VL HTTP server first."
         )
 
-    prompt = build_generation_prompt()
+    prompt = build_image_generation_prompt()
 
     if output_path is None:
-        output_path = OUTPUT_IMAGE_JSONL
+        output_path = esg_dir / f"{dir_name}_image_qa_qwen2_5vl.jsonl"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with output_path.open("w", encoding="utf-8") as fout:
         for page in tqdm(image_pages, desc="Generating QA for image pages"):
-            md_path = ESG_DIR / page.filename
+            md_path = esg_dir / page.filename
             captioned_images = extract_captioned_images_from_md(md_path)
             if not captioned_images:
                 continue
@@ -551,7 +570,9 @@ def generate_image_qa(output_path: Path | None = None) -> Path:
                     continue
 
                 try:
-                    response_text = generate_qa_for_image(str(img_path), prompt)
+                    response_text = generate_qa_for_image(
+                        str(img_path), f"{prompt}\n\n图片说明（caption）：{caption}"
+                    )
                 except Exception as e:
                     print(f"[ERROR] VQA generation failed for {img_path}: {e}")
                     continue
@@ -561,14 +582,14 @@ def generate_image_qa(output_path: Path | None = None) -> Path:
                     continue
 
                 rel_img = (
-                    str(img_path.relative_to(ESG_DIR))
-                    if ESG_DIR in img_path.parents
+                    str(img_path.relative_to(esg_dir))
+                    if esg_dir in img_path.parents
                     else str(img_path)
                 )
 
                 for idx, qa in enumerate(qa_items):
                     record = {
-                        "doc": "2024_Tencent_ESG",
+                        "doc": dir_name,
                         "page_number": page.page_number,
                         "page_filename": page.filename,
                         "image_path": rel_img,
@@ -585,17 +606,22 @@ def generate_image_qa(output_path: Path | None = None) -> Path:
     return output_path
 
 
-def generate_text_qa(output_path: Path | None = None) -> Path:
+def generate_text_qa(esg_dir: Path, csv_path: Path | None = None, output_path: Path | None = None) -> Path:
     """基于纯文本页面生成 QA，对应“文本模式”。"""
 
-    if not ESG_DIR.is_dir():
-        raise FileNotFoundError(f"ESG image directory not found: {ESG_DIR}")
+    if not esg_dir.is_dir():
+        raise FileNotFoundError(f"ESG image directory not found: {esg_dir}")
 
-    text_pages = load_text_pages(CSV_PATH)
+    dir_name = esg_dir.name
+
+    if csv_path is None:
+        csv_path = esg_dir / f"{dir_name}_page_table_image_summary.csv"
+
+    text_pages = load_text_pages(csv_path)
     if not text_pages:
-        raise RuntimeError(f"No pure-text pages found in CSV: {CSV_PATH}")
+        raise RuntimeError(f"No pure-text pages found in CSV: {csv_path}")
 
-    print(f"Loaded {len(text_pages)} text pages from {CSV_PATH}")
+    print(f"Loaded {len(text_pages)} text pages from {csv_path}")
 
     if _chat_completions_url() is None:
         raise RuntimeError(
@@ -605,12 +631,12 @@ def generate_text_qa(output_path: Path | None = None) -> Path:
     prompt = build_text_generation_prompt()
 
     if output_path is None:
-        output_path = OUTPUT_TEXT_JSONL
+        output_path = esg_dir / f"{dir_name}_text_qa_qwen2_5vl.jsonl"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with output_path.open("w", encoding="utf-8") as fout:
         for page in tqdm(text_pages, desc="Generating QA for text pages"):
-            md_path = ESG_DIR / page.filename
+            md_path = esg_dir / page.filename
             try:
                 text = md_path.read_text(encoding="utf-8", errors="ignore")
             except Exception:
@@ -628,7 +654,7 @@ def generate_text_qa(output_path: Path | None = None) -> Path:
 
             for idx, qa in enumerate(qa_items):
                 record = {
-                    "doc": "2024_Tencent_ESG",
+                    "doc": dir_name,
                     "page_number": page.page_number,
                     "page_filename": page.filename,
                     "qa_index": idx,
@@ -655,28 +681,29 @@ if __name__ == "__main__":  # pragma: no cover
         help="选择 QA 构造模式: table=表格, image=图片(需 caption), text=纯文本",
     )
     parser.add_argument(
-        "--output-jsonl",
+        "--esg_dir",
         type=str,
-        default="",
-        help="输出 JSONL 文件路径(可选)。不指定时按模式使用默认文件名。",
+        required=True,
+        help="Directory containing ESG pages (Markdown and images).",
     )
 
     args = parser.parse_args()
 
+    esg_dir = Path(args.esg_dir)
+    dir_name = esg_dir.name
+    csv_path = esg_dir / f"{dir_name}_page_table_image_summary.csv"
+
     output_path: Path | None
-    if args.output_jsonl:
-        output_path = Path(args.output_jsonl)
+    if args.mode == "table":
+        output_path = esg_dir / f"{dir_name}_table_qa_qwen2_5vl.jsonl"
+    elif args.mode == "image":
+        output_path = esg_dir / f"{dir_name}_image_qa_qwen2_5vl.jsonl"
     else:
-        if args.mode == "table":
-            output_path = OUTPUT_JSONL
-        elif args.mode == "image":
-            output_path = OUTPUT_IMAGE_JSONL
-        else:
-            output_path = OUTPUT_TEXT_JSONL
+        output_path = esg_dir / f"{dir_name}_text_qa_qwen2_5vl.jsonl"
 
     if args.mode == "table":
-        generate_table_qa(output_path)
+        generate_table_qa(esg_dir, csv_path, output_path)
     elif args.mode == "image":
-        generate_image_qa(output_path)
+        generate_image_qa(esg_dir, csv_path, output_path)
     else:
-        generate_text_qa(output_path)
+        generate_text_qa(esg_dir, csv_path, output_path)

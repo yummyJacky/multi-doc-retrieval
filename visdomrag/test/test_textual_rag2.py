@@ -186,8 +186,8 @@ if __name__ == "__main__":
         "--pdf-path",
         type=List[str],
         default=[
-            "/home/zechuan/m3docrag/contents/2024_Tencent_ESG.pdf",
-            "/home/zechuan/m3docrag/contents/2024_sanqi_ESG.pdf",
+            # "/home/zechuan/m3docrag/contents/2024_Tencent_ESG.pdf",
+            # "/home/zechuan/m3docrag/contents/2024_sanqi_ESG.pdf",
             "/home/zechuan/m3docrag/contents/2024_architecture_ESG.pdf",
         ],
         help="Path to the PDF file for integration tests.",

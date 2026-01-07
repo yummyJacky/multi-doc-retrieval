@@ -138,6 +138,8 @@ data/
 faiss_index/
 job/
 OCR*/
+.files/
+.chainlit/
 # for MacOS
 *.DS_Store
 results/

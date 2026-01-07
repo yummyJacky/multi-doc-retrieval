@@ -38,7 +38,7 @@ def download_hf_model(model_name: str, local_path: str):
 
 
 if __name__ == "__main__":
-    TARGET_MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct" 
+    TARGET_MODEL_NAME = "zai-org/AutoGLM-Phone-9B" 
     
     # 您希望将模型文件存储到的本地指定目录
     TARGET_LOCAL_PATH = "/mnt/SSD2_8TB/zechuan/huggingface" 

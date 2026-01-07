@@ -2,6 +2,7 @@ import argparse
 import json
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -13,16 +14,11 @@ from textual_rag import TextualRAGEngine
 logger = logging.getLogger("VisDoMRAG")
 
 
-ESG_DIR = Path(__file__).resolve().parent / "results" / "dots_ocr" / "2024_Tencent_ESG"
-JSONL_PATH = ESG_DIR / "2024_Tencent_ESG_table_qa_qwen2_5vl.jsonl"
-PDF_DEFAULT = Path(__file__).resolve().parent.parent / "contents" / "2024_Tencent_ESG.pdf"
-
-
 def load_qa_samples(jsonl_path: Path) -> List[Dict]:
     """Load QA records from the ESG table QA JSONL file.
 
     Each line is a JSON object with at least:
-    - doc: "2024_Tencent_ESG"
+    - doc: "2024_xxx_ESG"
     - page_number: str
     - question: str
     - answer: str
@@ -44,7 +40,7 @@ def load_qa_samples(jsonl_path: Path) -> List[Dict]:
                 continue
             q = str(rec.get("question", "")).strip()
             page_str = str(rec.get("page_number", "")).strip()
-            doc = str(rec.get("doc", "")).strip() or "2024_Tencent_ESG"
+            doc = str(rec.get("doc", "")).strip()
             if not q or not page_str:
                 continue
             try:
@@ -65,13 +61,14 @@ class ESGMdParent:
     don't need to rerun OCR. This corresponds to your "no OCR, use existing md" mode.
     """
 
-    def __init__(self, text_retriever: str = "bm25", top_k: int = 5) -> None:
+    def __init__(self, esg_dir: Path, text_retriever: str = "bm25", top_k: int = 5) -> None:
+        self.esg_dir = esg_dir
         self.config: Dict[str, object] = {
             "text_chunk_size": 500,
             "text_chunk_overlap": 100,
         }
-        self.data_dir = str(ESG_DIR)
-        self.output_dir = str(ESG_DIR / "eval_textual_recall")
+        self.data_dir = str(self.esg_dir)
+        self.output_dir = str(self.esg_dir / "eval_textual_recall")
         os.makedirs(self.output_dir, exist_ok=True)
 
         self.llm_model = "dummy"
@@ -90,16 +87,16 @@ class ESGMdParent:
         if self.document_cache:
             return self.document_cache
 
-        doc_id = "2024_Tencent_ESG"
+        doc_id = self.esg_dir.name
 
         # Build a numeric page_no -> text mapping so that page index
         # (0-based) aligns with the `page_number` field in JSONL.
         page_texts: Dict[int, str] = {}
 
         # Use all markdown pages that match *_page_XXX.md or *_page_XXX_nohf.md
-        md_files = list(ESG_DIR.glob("*_page_*.md"))
+        md_files = list(self.esg_dir.glob("*_page_*.md"))
         if not md_files:
-            logger.warning("No markdown pages found under %s", ESG_DIR)
+            logger.warning("No markdown pages found under %s", self.esg_dir)
 
         for md_file in md_files:
             name = md_file.name
@@ -134,8 +131,8 @@ class ESGMdParent:
         return self.document_cache
 
 
-def build_textual_engine_from_md(text_retriever: str = "bm25", top_k: int = 5) -> TextualRAGEngine:
-    parent = ESGMdParent(text_retriever=text_retriever, top_k=top_k)
+def build_textual_engine_from_md(esg_dir: Path, text_retriever: str = "bm25", top_k: int = 5) -> TextualRAGEngine:
+    parent = ESGMdParent(esg_dir=esg_dir, text_retriever=text_retriever, top_k=top_k)
     engine = TextualRAGEngine(parent)
     return engine
 
@@ -215,18 +212,63 @@ def eval_recall(engine: TextualRAGEngine, samples: List[Dict]) -> Tuple[float, D
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate textual retrieval page recall on ESG table QA dataset.")
-    parser.add_argument("--mode", choices=["ocr", "md"], default="md", help="Retrieval backend: 'ocr' runs full OCR, 'md' uses existing markdown pages.")
-    parser.add_argument("--text-retriever", default="bm25", choices=["bm25", "minilm", "mpnet", "bge", "hybrid"], help="Text retriever type used by TextualRAGEngine.")
-    parser.add_argument("--top-k", type=int, default=5, help="Top-k contexts to retrieve.")
-    parser.add_argument("--limit", type=int, default=0, help="Optional limit on number of QA samples to evaluate (0 means all).")
-    parser.add_argument("--pdf-path", type=str, default=str(PDF_DEFAULT), help="Path to ESG PDF (used in 'ocr' mode).")
+    parser = argparse.ArgumentParser(
+        description="Evaluate textual retrieval page recall on ESG table QA dataset."
+    )
+
+    # Default paths (can be overridden by CLI)
+    default_esg_dir = Path(__file__).resolve().parent / "results" / "dots_ocr" / "2024_Tencent_ESG"
+    default_jsonl = default_esg_dir / "2024_Tencent_ESG_table_qa_qwen2_5vl.jsonl"
+    default_pdf = Path(__file__).resolve().parent.parent / "contents" / "2024_Tencent_ESG.pdf"
+
+    parser.add_argument(
+        "--mode",
+        choices=["ocr", "md"],
+        default="md",
+        help="Retrieval backend: 'ocr' runs full OCR, 'md' uses existing markdown pages.",
+    )
+    parser.add_argument(
+        "--text-retriever",
+        default="bm25",
+        choices=["bm25", "minilm", "mpnet", "bge", "hybrid"],
+        help="Text retriever type used by TextualRAGEngine.",
+    )
+    parser.add_argument(
+        "--top-k", type=int, default=5, help="Top-k contexts to retrieve."
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Optional limit on number of QA samples to evaluate (0 means all).",
+    )
+    parser.add_argument(
+        "--esg-dir",
+        type=str,
+        default=str(default_esg_dir),
+        help="Directory containing ESG markdown pages and QA JSONL (default: results/dots_ocr/2024_Tencent_ESG).",
+    )
+    parser.add_argument(
+        "--jsonl-path",
+        type=str,
+        default=str(default_jsonl),
+        help="Path to ESG QA JSONL file used as ground truth (default: 2024_Tencent_ESG_table_qa_qwen2_5vl.jsonl).",
+    )
+    parser.add_argument(
+        "--pdf-path",
+        type=str,
+        default=str(default_pdf),
+        help="Path to ESG PDF (used in 'ocr' mode).",
+    )
 
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
 
-    samples = load_qa_samples(JSONL_PATH)
+    esg_dir = Path(args.esg_dir)
+    jsonl_path = Path(args.jsonl_path)
+
+    samples = load_qa_samples(jsonl_path)
     if args.limit and args.limit > 0:
         samples = samples[: args.limit]
 
@@ -234,20 +276,48 @@ def main() -> None:
         pdf_path = Path(args.pdf_path)
         if not pdf_path.is_file():
             raise FileNotFoundError(f"PDF file not found: {pdf_path}")
-        engine = build_textual_engine_from_pdf(pdf_path, text_retriever=args.text_retriever, top_k=args.top_k)
+        engine = build_textual_engine_from_pdf(
+            pdf_path, text_retriever=args.text_retriever, top_k=args.top_k
+        )
     else:
-        engine = build_textual_engine_from_md(text_retriever=args.text_retriever, top_k=args.top_k)
+        if not esg_dir.is_dir():
+            raise FileNotFoundError(f"ESG directory not found: {esg_dir}")
+        engine = build_textual_engine_from_md(
+            esg_dir, text_retriever=args.text_retriever, top_k=args.top_k
+        )
 
     recall, hit_ranks = eval_recall(engine, samples)
 
-    print("==== Textual Retrieval Page Recall (ESG Table QA) ====")
-    print(f"Total samples: {len(samples)}")
-    print(f"Hits: {sum(hit_ranks.values())}")
-    print(f"Recall@{args.top_k}: {recall:.4f}")
+    # Prepare final summary lines (printed to stdout and saved to log file)
+    summary_lines = [
+        "==== Textual Retrieval Page Recall (ESG Table QA) ====",
+        f"Total samples: {len(samples)}",
+        f"Hits: {sum(hit_ranks.values())}",
+        f"Recall@{args.top_k}: {recall:.4f}",
+    ]
     if hit_ranks:
-        print("Hit rank distribution (rank: count):")
+        summary_lines.append("Hit rank distribution (rank: count):")
         for rank in sorted(hit_ranks.keys()):
-            print(f"  {rank}: {hit_ranks[rank]}")
+            summary_lines.append(f"  {rank}: {hit_ranks[rank]}")
+
+    # Print to console
+    for line in summary_lines:
+        print(line)
+
+    # Also append command-line arguments and the same summary to a log file
+    # under the ESG directory, so that only CLI args and the final block are recorded.
+    log_dir = esg_dir / "eval_textual_recall"
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = log_dir / "textual_recall_eval.log"
+
+    try:
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write("ARGS: " + " ".join(sys.argv[1:]) + "\n")
+            for line in summary_lines:
+                f.write(line + "\n")
+            f.write("\n")
+    except Exception as e:
+        logger.error("Failed to write textual recall log to %s: %s", log_path, e)
 
 
 if __name__ == "__main__":
