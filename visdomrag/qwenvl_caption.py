@@ -68,6 +68,107 @@ class QwenVLCaptioner:
             return False
         return True
 
+    def _classify_image_type(self, image_path: str) -> str:
+        """Classify image into logo / chart / photo using Qwen-VL.
+
+        Returns one of "logo", "chart", "photo". If classification fails, defaults to
+        "photo" so that we conservatively skip caption generation.
+        """
+        if not self._ensure_server_available():
+            return "photo"
+
+        if not os.path.exists(image_path):
+            self.logger.warning(
+                "Image file for classification not found: %s", image_path
+            )
+            return "photo"
+
+        url = self._chat_completions_url()
+        if url is None:
+            return "photo"
+
+        classify_prompt = (
+            "你是一个图像类型分类器。请根据图片内容，在下面三类中选择最合适的一类，"
+            "并且最终只输出一个英文单词，不要输出任何其他内容：\n"
+            "- logo：公司标志、品牌 Logo、商标、图标或简单装饰图案。\n"
+            "- chart：数据图表或曲线图，例如折线图、柱状图、饼图、散点图等，用来展示数值或统计信息。\n"
+            "- photo：普通照片或插画，包括人物、风景、城市、产品、示意图等。\n\n"
+            "回答时，只能输出下面三个单词之一：logo、chart、photo。"
+        )
+
+        try:
+            with open(image_path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode("utf-8")
+        except Exception as e:
+            self.logger.error(
+                "Error reading image for classification %s: %s", image_path, str(e)
+            )
+            return "photo"
+
+        data_url = f"data:image/png;base64,{b64}"
+
+        payload: Dict[str, Any] = {
+            "model": self.model_name,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                        {"type": "text", "text": classify_prompt},
+                    ],
+                }
+            ],
+            "max_tokens": 8,
+            "temperature": 0,
+        }
+
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                data=json.dumps(payload),
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            data = response.json()
+        except Exception as e:
+            self.logger.error(
+                "Error calling Qwen-VL classifier for %s: %s", image_path, str(e)
+            )
+            return "photo"
+
+        try:
+            choices = data.get("choices") or []
+            if not choices:
+                return "photo"
+            message = choices[0].get("message", {})
+            content = message.get("content")
+
+            if isinstance(content, str):
+                generated = content
+            else:
+                parts = []
+                for block in content or []:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        parts.append(block.get("text", ""))
+                generated = "".join(parts)
+
+            label = (generated or "").strip().strip("'\"").lower()
+            if label not in ("logo", "chart", "photo"):
+                return "photo"
+            return label
+        except Exception as e:
+            self.logger.error(
+                "Error parsing Qwen-VL classification response for %s: %s",
+                image_path,
+                str(e),
+            )
+            return "photo"
+
     def caption_image(self, image_path: str) -> str:
         """Generate a short caption for a single image file.
 
@@ -80,6 +181,12 @@ class QwenVLCaptioner:
 
         if not os.path.exists(image_path):
             self.logger.warning("Image file for captioning not found: %s", image_path)
+            return ""
+
+        # First classify the image type. Only generate captions for chart-like images
+        # to avoid wasting time on logos or purely decorative pictures.
+        image_type = self._classify_image_type(image_path)
+        if image_type != "chart":
             return ""
 
         url = self._chat_completions_url()

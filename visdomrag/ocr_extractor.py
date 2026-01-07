@@ -70,7 +70,7 @@ class OCRExtractor:
 
             pages: List[str] = []
             for res in tqdm(sorted(results, key=lambda r: r.get("page_no", 0)),desc="Generating the descriptive text for image..."):
-                md_path = res.get("md_content_path") or res.get("md_content_nohf_path")
+                md_path = res.get("md_content_nohf_path") or res.get("md_content_path")
                 page_no = res.get("page_no", len(pages)) + 1
                 page_text = ""
 
